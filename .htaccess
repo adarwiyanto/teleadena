@@ -1,5 +1,10 @@
-<FilesMatch "^(config\.php|auth\.php|telegram_log\.txt|telegram_error_log\.txt)$">
+<FilesMatch "^(config\.php|config\.sample\.php|auth\.php|telegram_log\.txt|telegram_error_log\.txt|.*\.sql)$">
     Require all denied
 </FilesMatch>
 
 Options -Indexes
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^uploads/telegram/.*\.(php|phtml|phar|cgi|pl|py|sh)$ - [F,L,NC]
+</IfModule>

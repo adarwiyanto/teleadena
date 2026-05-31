@@ -1,213 +1,386 @@
 <?php
 
 // webhook.php
-// Menerima pesan dari Telegram dan menyimpan ke database
+// Menerima pesan dari Telegram, menyimpan semua topik/forum, dan menganalisa foto/struk jika tersedia.
 
 require_once __DIR__ . '/config.php';
 
-date_default_timezone_set('Asia/Jakarta');
+date_default_timezone_set(defined('APP_TIMEZONE') ? APP_TIMEZONE : 'Asia/Jakarta');
 
 $rawData = file_get_contents('php://input');
 $update = json_decode($rawData, true);
 
-// Tetap simpan log mentah untuk debugging
-$logFile = __DIR__ . '/telegram_log.txt';
-file_put_contents(
-    $logFile,
-    "==== " . date('Y-m-d H:i:s') . " ====\n" . $rawData . "\n\n",
-    FILE_APPEND
-);
+logText('telegram_log.txt', "==== " . date('Y-m-d H:i:s') . " ====\n" . $rawData . "\n\n");
 
 try {
     if (!$update || !is_array($update)) {
-        http_response_code(200);
-        echo 'NO DATA';
-        exit;
+        ok('NO DATA');
     }
 
     $updateId = $update['update_id'] ?? null;
-
-    // Telegram bisa mengirim message, edited_message, channel_post, dll.
-    $message = null;
-
-    if (isset($update['message'])) {
-        $message = $update['message'];
-    } elseif (isset($update['edited_message'])) {
-        $message = $update['edited_message'];
-    } elseif (isset($update['channel_post'])) {
-        $message = $update['channel_post'];
-    }
+    $message = $update['message'] ?? $update['edited_message'] ?? $update['channel_post'] ?? null;
 
     if (!$message) {
-        http_response_code(200);
-        echo 'NO MESSAGE';
-        exit;
+        ok('NO MESSAGE');
     }
 
     $chat = $message['chat'] ?? [];
     $from = $message['from'] ?? [];
 
     $chatId = $chat['id'] ?? null;
+    if (!$chatId) {
+        ok('NO CHAT ID');
+    }
+
     $chatTitle = $chat['title'] ?? ($chat['first_name'] ?? null);
     $chatType = $chat['type'] ?? null;
-
     $messageId = $message['message_id'] ?? null;
-    $senderId = $from['id'] ?? null;
+    $messageThreadId = $message['message_thread_id'] ?? null;
+    $messageThreadIdForTopic = $messageThreadId ?: 0;
 
-    $senderNameParts = [];
-    if (!empty($from['first_name'])) {
-        $senderNameParts[] = $from['first_name'];
-    }
-    if (!empty($from['last_name'])) {
-        $senderNameParts[] = $from['last_name'];
-    }
-    $senderName = trim(implode(' ', $senderNameParts));
+    $senderId = $from['id'] ?? null;
+    $senderName = trim(implode(' ', array_filter([$from['first_name'] ?? null, $from['last_name'] ?? null])));
     $senderUsername = $from['username'] ?? null;
 
-    // Ambil text. Jika bukan text biasa, coba ambil caption.
-    $messageText = $message['text'] ?? ($message['caption'] ?? null);
+    $captionOrText = $message['text'] ?? ($message['caption'] ?? null);
+    $messageType = detectMessageType($message, $captionOrText);
+    $topicName = detectTopicName($message);
 
-    // Kalau tidak ada teks, tetap simpan tipe pesan
-    $messageType = 'text';
-    if (isset($message['photo'])) {
-        $messageType = 'photo';
-    } elseif (isset($message['video'])) {
-        $messageType = 'video';
-    } elseif (isset($message['document'])) {
-        $messageType = 'document';
-    } elseif (isset($message['voice'])) {
-        $messageType = 'voice';
-    } elseif (isset($message['sticker'])) {
-        $messageType = 'sticker';
-    } elseif ($messageText === null) {
-        $messageType = 'other';
-    }
-
-    // Waktu pesan dari Telegram dalam Unix timestamp
-    $messageDate = null;
-    if (!empty($message['date'])) {
-        $messageDate = date('Y-m-d H:i:s', (int)$message['date']);
-    }
-
-    if (!$chatId) {
-        http_response_code(200);
-        echo 'NO CHAT ID';
-        exit;
-    }
+    $messageDate = !empty($message['date']) ? date('Y-m-d H:i:s', (int)$message['date']) : date('Y-m-d H:i:s');
 
     $pdo = db();
+    saveGroup($pdo, $chatId, $chatTitle, $chatType);
 
-    // Simpan/update data grup
-    $stmtGroup = $pdo->prepare("
-        INSERT INTO telegram_groups 
-            (telegram_chat_id, group_name, group_type, is_active)
-        VALUES 
-            (:telegram_chat_id, :group_name, :group_type, 1)
-        ON DUPLICATE KEY UPDATE
-            group_name = VALUES(group_name),
-            group_type = VALUES(group_type),
-            updated_at = CURRENT_TIMESTAMP
-    ");
+    if ($topicName === null) {
+        $topicName = getKnownTopicName($pdo, $chatId, $messageThreadIdForTopic);
+    }
+    if ($topicName === null) {
+        $topicName = $messageThreadIdForTopic === 0 ? 'General / Topik Umum' : 'Topic #' . $messageThreadIdForTopic;
+    }
+    upsertTopic($pdo, $chatId, $messageThreadIdForTopic, $topicName, $messageDate);
 
-    $stmtGroup->execute([
-        ':telegram_chat_id' => $chatId,
-        ':group_name' => $chatTitle,
-        ':group_type' => $chatType,
-    ]);
+    $media = extractLargestPhoto($message);
+    $mediaFileId = $media['file_id'] ?? null;
+    $mediaFileUniqueId = $media['file_unique_id'] ?? null;
+    $mediaFilePath = null;
+    $mediaLocalPath = null;
+    $mediaPublicUrl = null;
+    $imageAnalysisText = null;
+    $imageAnalysisStatus = null;
+    $imageAnalysisError = null;
+    $analyzedAt = null;
 
-    // Deteksi kategori sederhana tahap awal
+    if ($messageType === 'photo' && $mediaFileId) {
+        try {
+            $download = downloadTelegramFile($mediaFileId, $chatId, $messageId);
+            $mediaFilePath = $download['telegram_file_path'] ?? null;
+            $mediaLocalPath = $download['local_path'] ?? null;
+            $mediaPublicUrl = $download['public_url'] ?? null;
+
+            $analysis = analyzeImageIfEnabled($mediaLocalPath, $captionOrText, $chatTitle, $topicName);
+            $imageAnalysisText = $analysis['text'] ?? null;
+            $imageAnalysisStatus = $analysis['status'] ?? null;
+            $imageAnalysisError = $analysis['error'] ?? null;
+            $analyzedAt = $analysis['analyzed_at'] ?? null;
+        } catch (Throwable $e) {
+            $imageAnalysisStatus = 'error';
+            $imageAnalysisError = $e->getMessage();
+            logText('telegram_error_log.txt', "==== " . date('Y-m-d H:i:s') . " PHOTO ERROR ====\n" . $e->getMessage() . "\n\n");
+        }
+    }
+
+    $messageText = buildStoredMessageText($captionOrText, $messageType, $imageAnalysisText);
     $detectedCategory = detectCategory($messageText);
 
-    // Simpan pesan
-    $stmtMsg = $pdo->prepare("
-        INSERT INTO telegram_messages
-            (
-                telegram_update_id,
-                telegram_chat_id,
-                telegram_message_id,
-                sender_id,
-                sender_name,
-                sender_username,
-                message_text,
-                message_date,
-                message_type,
-                detected_category,
-                raw_payload
-            )
-        VALUES
-            (
-                :telegram_update_id,
-                :telegram_chat_id,
-                :telegram_message_id,
-                :sender_id,
-                :sender_name,
-                :sender_username,
-                :message_text,
-                :message_date,
-                :message_type,
-                :detected_category,
-                :raw_payload
-            )
-    ");
+    $stmtMsg = $pdo->prepare("\n        INSERT INTO telegram_messages\n            (\n                telegram_update_id, telegram_chat_id, telegram_message_id, message_thread_id, topic_name,\n                sender_id, sender_name, sender_username, message_text, message_date, message_type,\n                media_file_id, media_file_unique_id, media_file_path, media_local_path, media_public_url,\n                image_analysis_text, image_analysis_status, image_analysis_error, analyzed_at,\n                detected_category, raw_payload\n            )\n        VALUES\n            (\n                :telegram_update_id, :telegram_chat_id, :telegram_message_id, :message_thread_id, :topic_name,\n                :sender_id, :sender_name, :sender_username, :message_text, :message_date, :message_type,\n                :media_file_id, :media_file_unique_id, :media_file_path, :media_local_path, :media_public_url,\n                :image_analysis_text, :image_analysis_status, :image_analysis_error, :analyzed_at,\n                :detected_category, :raw_payload\n            )\n    ");
 
     $stmtMsg->execute([
         ':telegram_update_id' => $updateId,
         ':telegram_chat_id' => $chatId,
         ':telegram_message_id' => $messageId,
+        ':message_thread_id' => $messageThreadId,
+        ':topic_name' => $topicName,
         ':sender_id' => $senderId,
         ':sender_name' => $senderName,
         ':sender_username' => $senderUsername,
         ':message_text' => $messageText,
         ':message_date' => $messageDate,
         ':message_type' => $messageType,
+        ':media_file_id' => $mediaFileId,
+        ':media_file_unique_id' => $mediaFileUniqueId,
+        ':media_file_path' => $mediaFilePath,
+        ':media_local_path' => $mediaLocalPath,
+        ':media_public_url' => $mediaPublicUrl,
+        ':image_analysis_text' => $imageAnalysisText,
+        ':image_analysis_status' => $imageAnalysisStatus,
+        ':image_analysis_error' => $imageAnalysisError,
+        ':analyzed_at' => $analyzedAt,
         ':detected_category' => $detectedCategory,
         ':raw_payload' => $rawData,
     ]);
 
-    http_response_code(200);
-    echo 'OK';
-
+    ok('OK');
 } catch (Throwable $e) {
-    // Simpan error supaya mudah dicek
-    $errorFile = __DIR__ . '/telegram_error_log.txt';
-    file_put_contents(
-        $errorFile,
-        "==== " . date('Y-m-d H:i:s') . " ====\n" .
-        $e->getMessage() . "\n" .
-        $e->getTraceAsString() . "\n\n",
-        FILE_APPEND
-    );
+    logText('telegram_error_log.txt', "==== " . date('Y-m-d H:i:s') . " ====\n" . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n\n");
+    ok('ERROR LOGGED');
+}
 
-    // Tetap balas 200 agar Telegram tidak spam retry terus
+function ok($text)
+{
     http_response_code(200);
-    echo 'ERROR LOGGED';
+    echo $text;
+    exit;
+}
+
+function logText($filename, $text)
+{
+    file_put_contents(__DIR__ . '/' . $filename, $text, FILE_APPEND);
+}
+
+function saveGroup(PDO $pdo, $chatId, $chatTitle, $chatType)
+{
+    $stmt = $pdo->prepare("\n        INSERT INTO telegram_groups (telegram_chat_id, group_name, group_type, is_active)\n        VALUES (:telegram_chat_id, :group_name, :group_type, 1)\n        ON DUPLICATE KEY UPDATE\n            group_name = VALUES(group_name),\n            group_type = VALUES(group_type),\n            updated_at = CURRENT_TIMESTAMP\n    ");
+    $stmt->execute([
+        ':telegram_chat_id' => $chatId,
+        ':group_name' => $chatTitle,
+        ':group_type' => $chatType,
+    ]);
+}
+
+function upsertTopic(PDO $pdo, $chatId, $threadId, $topicName, $seenAt)
+{
+    $stmt = $pdo->prepare("\n        INSERT INTO telegram_topics (telegram_chat_id, message_thread_id, topic_name, first_seen_at, last_seen_at)\n        VALUES (:chat_id, :thread_id, :topic_name, :seen_at, :seen_at)\n        ON DUPLICATE KEY UPDATE\n            topic_name = VALUES(topic_name),\n            last_seen_at = VALUES(last_seen_at),\n            updated_at = CURRENT_TIMESTAMP\n    ");
+    $stmt->execute([
+        ':chat_id' => $chatId,
+        ':thread_id' => $threadId ?: 0,
+        ':topic_name' => $topicName,
+        ':seen_at' => $seenAt,
+    ]);
+}
+
+function getKnownTopicName(PDO $pdo, $chatId, $threadId)
+{
+    $stmt = $pdo->prepare("\n        SELECT topic_name FROM telegram_topics\n        WHERE telegram_chat_id = :chat_id AND message_thread_id = :thread_id\n        LIMIT 1\n    ");
+    $stmt->execute([':chat_id' => $chatId, ':thread_id' => $threadId ?: 0]);
+    $row = $stmt->fetch();
+    return $row['topic_name'] ?? null;
+}
+
+function detectMessageType(array $message, $text)
+{
+    if (isset($message['photo'])) return 'photo';
+    if (isset($message['video'])) return 'video';
+    if (isset($message['document'])) return 'document';
+    if (isset($message['voice'])) return 'voice';
+    if (isset($message['sticker'])) return 'sticker';
+    if (isset($message['forum_topic_created'])) return 'topic_created';
+    if ($text !== null) return 'text';
+    return 'other';
+}
+
+function detectTopicName(array $message)
+{
+    if (!empty($message['forum_topic_created']['name'])) {
+        return $message['forum_topic_created']['name'];
+    }
+    if (!empty($message['reply_to_message']['forum_topic_created']['name'])) {
+        return $message['reply_to_message']['forum_topic_created']['name'];
+    }
+    if (!empty($message['reply_to_message']['reply_to_message']['forum_topic_created']['name'])) {
+        return $message['reply_to_message']['reply_to_message']['forum_topic_created']['name'];
+    }
+    return null;
+}
+
+function extractLargestPhoto(array $message)
+{
+    if (empty($message['photo']) || !is_array($message['photo'])) {
+        return null;
+    }
+    $photos = $message['photo'];
+    usort($photos, function ($a, $b) {
+        return (($b['file_size'] ?? 0) <=> ($a['file_size'] ?? 0));
+    });
+    return $photos[0] ?? null;
+}
+
+function downloadTelegramFile($fileId, $chatId, $messageId)
+{
+    if (!defined('TELEGRAM_BOT_TOKEN') || trim(TELEGRAM_BOT_TOKEN) === '') {
+        return ['telegram_file_path' => null, 'local_path' => null, 'public_url' => null];
+    }
+
+    $token = TELEGRAM_BOT_TOKEN;
+    $metaUrl = 'https://api.telegram.org/bot' . $token . '/getFile?file_id=' . urlencode($fileId);
+    $meta = jsonRequest($metaUrl);
+
+    if (empty($meta['ok']) || empty($meta['result']['file_path'])) {
+        throw new RuntimeException('Gagal mengambil file_path Telegram.');
+    }
+
+    $filePath = $meta['result']['file_path'];
+    $ext = pathinfo($filePath, PATHINFO_EXTENSION) ?: 'jpg';
+    $subdir = date('Y/m');
+    $baseDir = defined('TELEGRAM_UPLOAD_DIR') ? TELEGRAM_UPLOAD_DIR : (__DIR__ . '/uploads/telegram');
+    $targetDir = rtrim($baseDir, '/') . '/' . $subdir;
+    if (!is_dir($targetDir) && !mkdir($targetDir, 0755, true)) {
+        throw new RuntimeException('Folder upload tidak bisa dibuat: ' . $targetDir);
+    }
+
+    $safeChat = preg_replace('/[^0-9\-]/', '', (string)$chatId);
+    $safeMessage = preg_replace('/[^0-9]/', '', (string)$messageId);
+    $localPath = $targetDir . '/' . $safeChat . '_' . $safeMessage . '_' . substr(sha1($fileId), 0, 10) . '.' . $ext;
+
+    $downloadUrl = 'https://api.telegram.org/file/bot' . $token . '/' . $filePath;
+    $binary = rawRequest($downloadUrl);
+    if ($binary === false || $binary === '') {
+        throw new RuntimeException('Download file Telegram gagal.');
+    }
+    file_put_contents($localPath, $binary);
+
+    $publicUrl = null;
+    if (defined('TELEGRAM_UPLOAD_URL') && trim(TELEGRAM_UPLOAD_URL) !== '') {
+        $publicUrl = rtrim(TELEGRAM_UPLOAD_URL, '/') . '/' . $subdir . '/' . basename($localPath);
+    }
+
+    return ['telegram_file_path' => $filePath, 'local_path' => $localPath, 'public_url' => $publicUrl];
+}
+
+function analyzeImageIfEnabled($localPath, $caption, $groupName, $topicName)
+{
+    if (!defined('ENABLE_IMAGE_ANALYSIS') || !ENABLE_IMAGE_ANALYSIS) {
+        return ['status' => 'skipped', 'text' => null, 'error' => 'ENABLE_IMAGE_ANALYSIS=false', 'analyzed_at' => null];
+    }
+    if (!defined('OPENAI_API_KEY') || trim(OPENAI_API_KEY) === '') {
+        return ['status' => 'skipped', 'text' => null, 'error' => 'OPENAI_API_KEY kosong', 'analyzed_at' => null];
+    }
+    if (!$localPath || !is_file($localPath)) {
+        return ['status' => 'error', 'text' => null, 'error' => 'File lokal gambar tidak ditemukan', 'analyzed_at' => null];
+    }
+    $maxBytes = defined('MAX_IMAGE_ANALYSIS_BYTES') ? MAX_IMAGE_ANALYSIS_BYTES : 5242880;
+    if (filesize($localPath) > $maxBytes) {
+        return ['status' => 'skipped', 'text' => null, 'error' => 'Ukuran gambar melebihi batas', 'analyzed_at' => null];
+    }
+
+    $mime = mime_content_type($localPath) ?: 'image/jpeg';
+    $base64 = base64_encode(file_get_contents($localPath));
+    $dataUrl = 'data:' . $mime . ';base64,' . $base64;
+
+    $prompt = "Analisa gambar dari group Telegram untuk dashboard bisnis Adena.\n" .
+        "Group: " . ($groupName ?: '-') . "\n" .
+        "Topik: " . ($topicName ?: '-') . "\n" .
+        "Caption: " . ($caption ?: '-') . "\n\n" .
+        "Jika gambar adalah struk/nota/rekap transaksi, ekstrak teks penting: tanggal, toko/customer jika ada, item, jumlah, harga, total, metode pembayaran, status lunas/utang, dan catatan. " .
+        "Jika bukan struk, jelaskan isi gambar yang relevan untuk operasional. Jawab ringkas dalam bahasa Indonesia. Jangan mengarang angka yang tidak terbaca.";
+
+    $payload = [
+        'model' => defined('OPENAI_VISION_MODEL') ? OPENAI_VISION_MODEL : (defined('OPENAI_MODEL') ? OPENAI_MODEL : 'gpt-4.1-mini'),
+        'messages' => [[
+            'role' => 'user',
+            'content' => [
+                ['type' => 'text', 'text' => $prompt],
+                ['type' => 'image_url', 'image_url' => ['url' => $dataUrl]],
+            ],
+        ]],
+        'temperature' => 0.1,
+        'max_tokens' => 600,
+    ];
+
+    $response = postJson('https://api.openai.com/v1/chat/completions', $payload, [
+        'Authorization: Bearer ' . OPENAI_API_KEY,
+        'Content-Type: application/json',
+    ]);
+
+    $text = trim($response['choices'][0]['message']['content'] ?? '');
+    if ($text === '') {
+        return ['status' => 'error', 'text' => null, 'error' => 'OpenAI tidak mengembalikan teks analisa', 'analyzed_at' => null];
+    }
+
+    return ['status' => 'done', 'text' => $text, 'error' => null, 'analyzed_at' => date('Y-m-d H:i:s')];
+}
+
+function buildStoredMessageText($captionOrText, $messageType, $imageAnalysisText)
+{
+    $parts = [];
+    if ($captionOrText !== null && trim((string)$captionOrText) !== '') {
+        $parts[] = trim((string)$captionOrText);
+    }
+    if ($messageType === 'photo') {
+        $parts[] = '[photo]';
+    }
+    if ($imageAnalysisText) {
+        $parts[] = "[Analisa gambar]\n" . trim($imageAnalysisText);
+    }
+    return empty($parts) ? null : implode("\n\n", $parts);
 }
 
 function detectCategory($text)
 {
-    if (!$text) {
-        return null;
-    }
-
+    if (!$text) return null;
     $lower = mb_strtolower($text, 'UTF-8');
-
     $categories = [
-        'omset' => ['omset', 'revenue', 'pendapatan', 'total jual', 'penjualan hari ini'],
-        'order' => ['order', 'pesanan', 'booking', 'pesan', 'beli', 'checkout'],
+        'omset' => ['omset', 'revenue', 'pendapatan', 'total jual', 'penjualan hari ini', 'total', 'subtotal'],
+        'order' => ['order', 'pesanan', 'booking', 'pesan', 'beli', 'checkout', 'customer', 'item'],
         'komplain' => ['komplain', 'complain', 'keluhan', 'kecewa', 'marah', 'refund', 'retur'],
-        'stok' => ['stok', 'stock', 'habis', 'ready', 'kosong', 'restock'],
-        'pembayaran' => ['transfer', 'qris', 'cash', 'tunai', 'bayar', 'payment', 'lunas'],
+        'stok' => ['stok', 'stock', 'habis', 'ready', 'kosong', 'restock', 'produksi'],
+        'pembayaran' => ['transfer', 'qris', 'cash', 'tunai', 'bayar', 'payment', 'lunas', 'utang'],
         'pengiriman' => ['kirim', 'delivery', 'gojek', 'grab', 'kurir', 'ongkir'],
         'news' => ['info', 'berita', 'pengumuman', 'urgent', 'penting'],
     ];
-
     foreach ($categories as $category => $keywords) {
         foreach ($keywords as $keyword) {
-            if (mb_strpos($lower, $keyword) !== false) {
-                return $category;
-            }
+            if (mb_strpos($lower, $keyword) !== false) return $category;
         }
     }
-
     return 'umum';
+}
+
+function jsonRequest($url)
+{
+    $raw = rawRequest($url);
+    $json = json_decode($raw, true);
+    if (!is_array($json)) throw new RuntimeException('Response JSON tidak valid.');
+    return $json;
+}
+
+function postJson($url, array $payload, array $headers = [])
+{
+    $body = json_encode($payload, JSON_UNESCAPED_UNICODE);
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_POSTFIELDS => $body,
+            CURLOPT_TIMEOUT => 60,
+        ]);
+        $raw = curl_exec($ch);
+        $err = curl_error($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($raw === false || $code >= 400) throw new RuntimeException('HTTP error OpenAI: ' . $code . ' ' . $err . ' ' . substr((string)$raw, 0, 500));
+    } else {
+        $context = stream_context_create(['http' => ['method' => 'POST', 'header' => implode("\r\n", $headers), 'content' => $body, 'timeout' => 60]]);
+        $raw = file_get_contents($url, false, $context);
+        if ($raw === false) throw new RuntimeException('HTTP request gagal.');
+    }
+    $json = json_decode($raw, true);
+    if (!is_array($json)) throw new RuntimeException('Response JSON tidak valid.');
+    return $json;
+}
+
+function rawRequest($url)
+{
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 60]);
+        $raw = curl_exec($ch);
+        $err = curl_error($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($raw === false || $code >= 400) throw new RuntimeException('HTTP error: ' . $code . ' ' . $err);
+        return $raw;
+    }
+    return file_get_contents($url);
 }

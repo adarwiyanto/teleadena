@@ -4,8 +4,9 @@ require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/auth.php';
 requireAccessToken();
 
-date_default_timezone_set('Asia/Jakarta');
+date_default_timezone_set(defined('APP_TIMEZONE') ? APP_TIMEZONE : 'Asia/Jakarta');
 
+$token = $_GET['token'] ?? $_POST['token'] ?? '';
 $aiError = null;
 $aiSummary = null;
 
@@ -14,49 +15,16 @@ try {
 
     $period = $_GET['period'] ?? 'today';
     $groupId = $_GET['group_id'] ?? '';
+    $topicThreadId = $_GET['topic_thread_id'] ?? '';
+    $messageType = $_GET['message_type'] ?? '';
     $mode = $_POST['mode'] ?? ($_GET['mode'] ?? 'local');
 
     [$dateStart, $dateEnd, $periodLabel] = resolvePeriod($period);
 
-    $where = [
-        'm.message_date >= :date_start',
-        'm.message_date <= :date_end'
-    ];
-
-    $params = [
-        ':date_start' => $dateStart,
-        ':date_end' => $dateEnd,
-    ];
-
-    if ($groupId !== '') {
-        $where[] = 'm.telegram_chat_id = :group_id';
-        $params[':group_id'] = $groupId;
-    }
-
-    $whereSql = 'WHERE ' . implode(' AND ', $where);
-
-    $stmtGroups = $pdo->query("
-        SELECT telegram_chat_id, group_name, group_type
-        FROM telegram_groups
-        WHERE is_active = 1
-        ORDER BY group_name ASC
-    ");
-    $groups = $stmtGroups->fetchAll();
-
-    $stmt = $pdo->prepare("
-        SELECT 
-            m.*,
-            g.group_name
-        FROM telegram_messages m
-        LEFT JOIN telegram_groups g 
-            ON g.telegram_chat_id = m.telegram_chat_id
-        {$whereSql}
-        ORDER BY m.message_date ASC, m.id ASC
-        LIMIT 3000
-    ");
-    $stmt->execute($params);
-    $messages = $stmt->fetchAll();
-
+    [$whereSql, $params] = buildMessageWhere($dateStart, $dateEnd, $groupId, $topicThreadId, $messageType);
+    $groups = fetchGroups($pdo);
+    $topics = fetchTopics($pdo, $groupId);
+    $messages = fetchMessages($pdo, $whereSql, $params, 5000);
     $localSummary = buildLocalSummary($messages, $periodLabel, $dateStart, $dateEnd);
 
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && $mode === 'ai') {
@@ -67,40 +35,13 @@ try {
         } else {
             try {
                 $aiSummary = generateAiSummary($messages, $periodLabel, $dateStart, $dateEnd);
-
                 $targetGroupName = null;
                 if ($groupId !== '') {
                     foreach ($groups as $g) {
-                        if ((string)$g['telegram_chat_id'] === (string)$groupId) {
-                            $targetGroupName = $g['group_name'];
-                            break;
-                        }
+                        if ((string)$g['telegram_chat_id'] === (string)$groupId) $targetGroupName = $g['group_name'];
                     }
                 }
-
-                $stmtSave = $pdo->prepare("
-                    INSERT INTO telegram_summaries
-                        (
-                            summary_period,
-                            telegram_chat_id,
-                            group_name,
-                            date_start,
-                            date_end,
-                            summary_text,
-                            key_actions
-                        )
-                    VALUES
-                        (
-                            :summary_period,
-                            :telegram_chat_id,
-                            :group_name,
-                            :date_start,
-                            :date_end,
-                            :summary_text,
-                            :key_actions
-                        )
-                ");
-
+                $stmtSave = $pdo->prepare("\n                    INSERT INTO telegram_summaries\n                        (summary_period, telegram_chat_id, group_name, date_start, date_end, summary_text, key_actions)\n                    VALUES\n                        (:summary_period, :telegram_chat_id, :group_name, :date_start, :date_end, :summary_text, :key_actions)\n                ");
                 $stmtSave->execute([
                     ':summary_period' => $period,
                     ':telegram_chat_id' => $groupId !== '' ? $groupId : null,
@@ -108,868 +49,253 @@ try {
                     ':date_start' => $dateStart,
                     ':date_end' => $dateEnd,
                     ':summary_text' => $aiSummary,
-                    ':key_actions' => extractKeyActionsPlain($aiSummary),
+                    ':key_actions' => null,
                 ]);
-
             } catch (Throwable $e) {
-                $aiError = $e->getMessage();
+                $aiError = 'Gagal membuat AI summary: ' . $e->getMessage();
             }
         }
     }
-
 } catch (Throwable $e) {
     http_response_code(500);
-    echo '<h3>Error</h3>';
-    echo '<pre>' . htmlspecialchars($e->getMessage()) . '</pre>';
+    echo '<h3>Error</h3><pre>' . htmlspecialchars($e->getMessage()) . '</pre>';
     exit;
 }
 
+function e($value) { return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8'); }
+function u($token, array $params = []) { return '?' . http_build_query(array_merge(['token' => $token], $params)); }
+
 function resolvePeriod($period)
 {
-    $today = new DateTime('today', new DateTimeZone('Asia/Jakarta'));
-
+    $now = new DateTime('now');
     if ($period === 'yesterday') {
-        $start = (clone $today)->modify('-1 day')->format('Y-m-d 00:00:00');
-        $end = (clone $today)->modify('-1 day')->format('Y-m-d 23:59:59');
-        return [$start, $end, 'Kemarin'];
+        $start = (new DateTime('yesterday'))->setTime(0, 0, 0);
+        $end = (new DateTime('yesterday'))->setTime(23, 59, 59);
+        return [$start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), 'Kemarin'];
     }
-
-    if ($period === 'week') {
-        $start = (clone $today)->modify('-6 days')->format('Y-m-d 00:00:00');
-        $end = (clone $today)->format('Y-m-d 23:59:59');
-        return [$start, $end, '7 hari terakhir'];
+    if ($period === '7days') {
+        $start = (new DateTime('-6 days'))->setTime(0, 0, 0);
+        $end = $now->setTime(23, 59, 59);
+        return [$start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), '7 Hari Terakhir'];
     }
+    if ($period === 'month') {
+        $start = (new DateTime('first day of this month'))->setTime(0, 0, 0);
+        $end = (new DateTime('last day of this month'))->setTime(23, 59, 59);
+        return [$start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), 'Bulan Ini'];
+    }
+    $start = (new DateTime('today'))->setTime(0, 0, 0);
+    $end = (new DateTime('today'))->setTime(23, 59, 59);
+    return [$start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), 'Hari Ini'];
+}
 
-    $start = $today->format('Y-m-d 00:00:00');
-    $end = $today->format('Y-m-d 23:59:59');
-    return [$start, $end, 'Hari ini'];
+function buildMessageWhere($dateStart, $dateEnd, $groupId, $topicThreadId, $messageType)
+{
+    $where = ['m.message_date >= :date_start', 'm.message_date <= :date_end'];
+    $params = [':date_start' => $dateStart, ':date_end' => $dateEnd];
+    if ($groupId !== '') { $where[] = 'm.telegram_chat_id = :group_id'; $params[':group_id'] = $groupId; }
+    if ($topicThreadId !== '') {
+        if ((string)$topicThreadId === '0') $where[] = '(m.message_thread_id IS NULL OR m.message_thread_id = 0)';
+        else { $where[] = 'm.message_thread_id = :thread_id'; $params[':thread_id'] = $topicThreadId; }
+    }
+    if ($messageType !== '') { $where[] = 'm.message_type = :message_type'; $params[':message_type'] = $messageType; }
+    return ['WHERE ' . implode(' AND ', $where), $params];
+}
+
+function fetchGroups(PDO $pdo)
+{
+    return $pdo->query("SELECT telegram_chat_id, group_name, group_type FROM telegram_groups WHERE is_active = 1 ORDER BY group_name ASC")->fetchAll();
+}
+
+function fetchTopics(PDO $pdo, $groupId = '')
+{
+    $sql = "SELECT t.*, g.group_name FROM telegram_topics t LEFT JOIN telegram_groups g ON g.telegram_chat_id=t.telegram_chat_id";
+    $params = [];
+    if ($groupId !== '') { $sql .= " WHERE t.telegram_chat_id = :group_id"; $params[':group_id'] = $groupId; }
+    $sql .= " ORDER BY g.group_name ASC, t.message_thread_id ASC";
+    $stmt = $pdo->prepare($sql); $stmt->execute($params); return $stmt->fetchAll();
+}
+
+function fetchMessages(PDO $pdo, $whereSql, array $params, $limit)
+{
+    $stmt = $pdo->prepare("\n        SELECT m.*, g.group_name\n        FROM telegram_messages m\n        LEFT JOIN telegram_groups g ON g.telegram_chat_id = m.telegram_chat_id\n        {$whereSql}\n        ORDER BY m.message_date ASC, m.id ASC\n        LIMIT " . (int)$limit . "\n    ");
+    $stmt->execute($params);
+    return $stmt->fetchAll();
 }
 
 function buildLocalSummary(array $messages, $periodLabel, $dateStart, $dateEnd)
 {
     $summary = [
-        'period_label' => $periodLabel,
-        'date_start' => $dateStart,
-        'date_end' => $dateEnd,
-        'total_messages' => count($messages),
-        'groups' => [],
-        'categories' => [],
-        'important_messages' => [],
-        'orders' => [],
-        'omset' => [],
-        'stock' => [],
-        'complaints' => [],
-        'payments' => [],
-        'delivery' => [],
-        'news' => [],
-        'action_items' => [],
+        'period_label' => $periodLabel, 'date_start' => $dateStart, 'date_end' => $dateEnd,
+        'total_messages' => count($messages), 'text_messages' => 0, 'photo_messages' => 0,
+        'image_done' => 0, 'image_skipped' => 0, 'image_error' => 0,
+        'groups' => [], 'topics' => [], 'categories' => [],
+        'orders' => [], 'omset' => [], 'stock' => [], 'complaints' => [], 'payments' => [], 'delivery' => [], 'news' => [], 'images' => [],
     ];
+    foreach ($messages as $m) {
+        $group = $m['group_name'] ?: (string)$m['telegram_chat_id'];
+        $thread = $m['message_thread_id'] ?? 0;
+        $topic = $m['topic_name'] ?: (($thread && (int)$thread !== 0) ? 'Topic #' . $thread : 'General / Topik Umum');
+        $cat = $m['detected_category'] ?: 'umum';
+        $type = $m['message_type'] ?: 'text';
+        $text = trim((string)($m['message_text'] ?? ''));
+        $preview = mb_substr(preg_replace('/\s+/', ' ', $text), 0, 260);
+        $item = ['time' => $m['message_date'], 'group' => $group, 'topic' => $topic, 'sender' => $m['sender_name'], 'text' => $preview, 'type' => $type];
 
-    foreach ($messages as $msg) {
-        $groupName = $msg['group_name'] ?: ('Group ' . $msg['telegram_chat_id']);
-        $category = $msg['detected_category'] ?: 'umum';
-        $text = trim((string)($msg['message_text'] ?? ''));
-        $sender = $msg['sender_name'] ?: '-';
-        $time = $msg['message_date'] ?: '-';
+        if ($type === 'photo') $summary['photo_messages']++; else $summary['text_messages']++;
+        if ($m['image_analysis_status'] === 'done') $summary['image_done']++;
+        if ($m['image_analysis_status'] === 'skipped') $summary['image_skipped']++;
+        if ($m['image_analysis_status'] === 'error') $summary['image_error']++;
 
-        if (!isset($summary['groups'][$groupName])) {
-            $summary['groups'][$groupName] = [
-                'total' => 0,
-                'categories' => [],
-                'important' => [],
-            ];
-        }
+        if (!isset($summary['groups'][$group])) $summary['groups'][$group] = ['total' => 0, 'photos' => 0, 'topics' => [], 'categories' => [], 'important' => []];
+        $summary['groups'][$group]['total']++;
+        if ($type === 'photo') $summary['groups'][$group]['photos']++;
+        $summary['groups'][$group]['topics'][$topic] = ($summary['groups'][$group]['topics'][$topic] ?? 0) + 1;
+        $summary['groups'][$group]['categories'][$cat] = ($summary['groups'][$group]['categories'][$cat] ?? 0) + 1;
 
-        $summary['groups'][$groupName]['total']++;
+        $topicKey = $group . ' / ' . $topic;
+        if (!isset($summary['topics'][$topicKey])) $summary['topics'][$topicKey] = ['total' => 0, 'photos' => 0, 'categories' => [], 'important' => []];
+        $summary['topics'][$topicKey]['total']++;
+        if ($type === 'photo') $summary['topics'][$topicKey]['photos']++;
+        $summary['topics'][$topicKey]['categories'][$cat] = ($summary['topics'][$topicKey]['categories'][$cat] ?? 0) + 1;
 
-        if (!isset($summary['groups'][$groupName]['categories'][$category])) {
-            $summary['groups'][$groupName]['categories'][$category] = 0;
-        }
+        $summary['categories'][$cat] = ($summary['categories'][$cat] ?? 0) + 1;
+        if ($type === 'photo') $summary['images'][] = $item;
 
-        $summary['groups'][$groupName]['categories'][$category]++;
-
-        if (!isset($summary['categories'][$category])) {
-            $summary['categories'][$category] = 0;
-        }
-
-        $summary['categories'][$category]++;
-
-        if ($text === '') {
-            continue;
-        }
-
-        $item = [
-            'time' => $time,
-            'group' => $groupName,
-            'sender' => $sender,
-            'category' => $category,
-            'text' => $text,
-        ];
-
-        if (isImportant($text)) {
-            $summary['important_messages'][] = $item;
-            $summary['groups'][$groupName]['important'][] = $item;
-        }
-
-        if ($category === 'order' || containsAny($text, ['order', 'pesan', 'pesanan', 'booking', 'beli', 'checkout'])) {
-            $summary['orders'][] = $item;
-        }
-
-        if ($category === 'omset' || containsAny($text, ['omset', 'pendapatan', 'revenue', 'total jual', 'penjualan'])) {
-            $summary['omset'][] = $item;
-        }
-
-        if ($category === 'stok' || containsAny($text, ['stok', 'stock', 'habis', 'kosong', 'ready', 'restock', 'produksi'])) {
-            $summary['stock'][] = $item;
-        }
-
-        if ($category === 'komplain' || containsAny($text, ['komplain', 'complain', 'keluhan', 'refund', 'retur', 'kecewa', 'marah', 'telat', 'terlambat'])) {
-            $summary['complaints'][] = $item;
-        }
-
-        if ($category === 'pembayaran' || containsAny($text, ['transfer', 'qris', 'cash', 'tunai', 'bayar', 'payment', 'lunas'])) {
-            $summary['payments'][] = $item;
-        }
-
-        if ($category === 'pengiriman' || containsAny($text, ['kirim', 'delivery', 'kurir', 'gojek', 'grab', 'ongkir', 'pickup'])) {
-            $summary['delivery'][] = $item;
-        }
-
-        if ($category === 'news' || containsAny($text, ['info', 'berita', 'pengumuman', 'urgent', 'penting'])) {
-            $summary['news'][] = $item;
-        }
+        $lower = mb_strtolower($text, 'UTF-8');
+        if ($cat === 'order' || containsAny($lower, ['order', 'pesanan', 'beli', 'checkout', 'customer'])) $summary['orders'][] = $item;
+        if ($cat === 'omset' || containsAny($lower, ['omset', 'revenue', 'pendapatan', 'total jual', 'total', 'subtotal'])) $summary['omset'][] = $item;
+        if ($cat === 'stok' || containsAny($lower, ['stok', 'stock', 'habis', 'ready', 'kosong', 'restock', 'produksi'])) $summary['stock'][] = $item;
+        if ($cat === 'komplain' || containsAny($lower, ['komplain', 'complain', 'keluhan', 'refund', 'retur', 'telat'])) $summary['complaints'][] = $item;
+        if ($cat === 'pembayaran' || containsAny($lower, ['transfer', 'qris', 'cash', 'tunai', 'bayar', 'payment', 'lunas', 'utang'])) $summary['payments'][] = $item;
+        if ($cat === 'pengiriman' || containsAny($lower, ['kirim', 'delivery', 'kurir', 'gojek', 'grab', 'ongkir', 'pickup'])) $summary['delivery'][] = $item;
+        if ($cat === 'news' || containsAny($lower, ['info', 'berita', 'pengumuman', 'urgent', 'penting'])) $summary['news'][] = $item;
     }
-
-    $summary['action_items'] = makeActionItems($summary);
-
+    arsort($summary['categories']);
+    uasort($summary['topics'], fn($a, $b) => $b['total'] <=> $a['total']);
+    uasort($summary['groups'], fn($a, $b) => $b['total'] <=> $a['total']);
     return $summary;
+}
+
+function containsAny($text, array $needles)
+{
+    foreach ($needles as $needle) if (mb_strpos($text, $needle) !== false) return true;
+    return false;
 }
 
 function generateAiSummary(array $messages, $periodLabel, $dateStart, $dateEnd)
 {
-    $grouped = [];
-
-    foreach ($messages as $msg) {
-        $groupName = $msg['group_name'] ?: $msg['telegram_chat_id'];
-
-        if (!isset($grouped[$groupName])) {
-            $grouped[$groupName] = [];
-        }
-
-        $sender = $msg['sender_name'] ?: '-';
-        $category = $msg['detected_category'] ?: 'umum';
-        $time = $msg['message_date'] ?: '-';
-        $text = trim((string)($msg['message_text'] ?: '[' . $msg['message_type'] . ']'));
-
-        if ($text === '') {
-            continue;
-        }
-
-        $grouped[$groupName][] = "[{$time}] ({$category}) {$sender}: {$text}";
+    $lines = [];
+    foreach (array_slice($messages, -1200) as $m) {
+        $group = $m['group_name'] ?: $m['telegram_chat_id'];
+        $topic = $m['topic_name'] ?: (($m['message_thread_id'] ?? null) ? 'Topic #' . $m['message_thread_id'] : 'General / Topik Umum');
+        $sender = $m['sender_name'] ?: '-';
+        $type = $m['message_type'] ?: 'text';
+        $text = trim((string)($m['message_text'] ?? ''));
+        if ($text === '' && $type === 'photo') $text = '[photo tanpa hasil analisa]';
+        $lines[] = '[' . $m['message_date'] . ' | Group: ' . $group . ' | Topic: ' . $topic . ' | Sender: ' . $sender . ' | Type: ' . $type . '] ' . $text;
     }
+    $content = implode("\n", $lines);
+    if (mb_strlen($content, 'UTF-8') > 55000) $content = mb_substr($content, -55000, null, 'UTF-8');
 
-    $conversationText = '';
+    $prompt = "Buat rangkuman dashboard operasional dari chat Telegram. Data mencakup semua group dan semua topik/forum, termasuk hasil analisa foto/struk bila ada.\n" .
+        "Periode: {$periodLabel} ({$dateStart} s.d. {$dateEnd})\n\n" .
+        "Format wajib:\n" .
+        "1. Gambaran umum\n2. Ringkasan per group\n3. Ringkasan per topik\n4. Order/pesanan\n5. Omset/penjualan/pembayaran\n6. Stok/produksi\n7. Foto/struk yang terbaca\n8. Risiko/komplain\n9. Action item prioritas\n\n" .
+        "Jangan mengarang angka. Jika angka tidak jelas, tulis tidak terbaca/tidak disebutkan.\n\nDATA:\n" . $content;
 
-    foreach ($grouped as $groupName => $lines) {
-        $conversationText .= "\n\n=== GRUP: {$groupName} ===\n";
-        $conversationText .= implode("\n", array_slice($lines, 0, 500));
-    }
-
-    if (mb_strlen($conversationText, 'UTF-8') > 60000) {
-        $conversationText = mb_substr($conversationText, 0, 60000, 'UTF-8') . "\n\n[Data dipangkas karena terlalu panjang]";
-    }
-
-    $systemPrompt = <<<PROMPT
-Anda adalah Telegram Summary Agent untuk pemilik bisnis.
-
-Tugas:
-1. Ringkas percakapan grup Telegram secara padat dan berguna.
-2. Fokus pada news, omset, order, stok, pembayaran, pengiriman, komplain, masalah operasional, peluang bisnis, dan pesan yang perlu ditindaklanjuti.
-3. Jangan mengarang data.
-4. Bila angka tidak jelas, tulis "tidak disebutkan jelas".
-5. Pisahkan fakta dari interpretasi.
-6. Tulis dalam Bahasa Indonesia.
-
-Format output wajib:
-
-RANGKUMAN TELEGRAM - [PERIODE]
-
-1. GAMBARAN UMUM
-- ...
-
-2. RINGKASAN PER GRUP
-Nama Grup:
-- Topik utama:
-- Order/omset:
-- Komplain/risiko:
-- Hal yang perlu diperhatikan:
-
-3. OMSET / ORDER / STOK
-- ...
-
-4. KOMPLAIN DAN MASALAH OPERASIONAL
-- ...
-
-5. NEWS / INFO PENTING
-- ...
-
-6. ACTION ITEM UNTUK DOKTER
-- [Prioritas tinggi] ...
-- [Prioritas sedang] ...
-- [Prioritas rendah] ...
-
-7. PESAN YANG PERLU DIBALAS
-- ...
-
-8. CATATAN AKHIR
-- ...
-PROMPT;
-
-    $userPrompt = "Periode: {$periodLabel}\nRentang waktu: {$dateStart} sampai {$dateEnd}\n\nData chat Telegram:\n{$conversationText}";
-
-    $payload = [
-        'model' => OPENAI_MODEL,
-        'input' => [
-            [
-                'role' => 'system',
-                'content' => $systemPrompt
-            ],
-            [
-                'role' => 'user',
-                'content' => $userPrompt
-            ]
-        ],
-        'temperature' => 0.2,
-    ];
-
-    $ch = curl_init('https://api.openai.com/v1/responses');
-
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST => true,
-        CURLOPT_HTTPHEADER => [
-            'Content-Type: application/json',
-            'Authorization: Bearer ' . OPENAI_API_KEY,
-        ],
-        CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE),
-        CURLOPT_TIMEOUT => 90,
-    ]);
-
-    $response = curl_exec($ch);
-
-    if ($response === false) {
-        throw new Exception('Curl error: ' . curl_error($ch));
-    }
-
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    $json = json_decode($response, true);
-
-    if ($httpCode < 200 || $httpCode >= 300) {
-        $message = $json['error']['message'] ?? $response;
-        throw new Exception('OpenAI API error: ' . $message);
-    }
-
-    if (isset($json['output_text'])) {
-        return trim($json['output_text']);
-    }
-
-    $texts = [];
-
-    if (!empty($json['output']) && is_array($json['output'])) {
-        foreach ($json['output'] as $item) {
-            if (!empty($item['content']) && is_array($item['content'])) {
-                foreach ($item['content'] as $content) {
-                    if (isset($content['text'])) {
-                        $texts[] = $content['text'];
-                    }
-                }
-            }
-        }
-    }
-
-    if (!empty($texts)) {
-        return trim(implode("\n", $texts));
-    }
-
-    return 'Ringkasan AI berhasil dibuat, tetapi format respons tidak terbaca.';
+    $payload = ['model' => defined('OPENAI_MODEL') ? OPENAI_MODEL : 'gpt-4.1-mini', 'messages' => [['role' => 'user', 'content' => $prompt]], 'temperature' => 0.2];
+    $res = postJson('https://api.openai.com/v1/chat/completions', $payload, ['Authorization: Bearer ' . OPENAI_API_KEY, 'Content-Type: application/json']);
+    return trim($res['choices'][0]['message']['content'] ?? '');
 }
 
-function containsAny($text, array $keywords)
+function postJson($url, array $payload, array $headers = [])
 {
-    $lower = mb_strtolower($text, 'UTF-8');
-
-    foreach ($keywords as $keyword) {
-        if (mb_strpos($lower, mb_strtolower($keyword, 'UTF-8')) !== false) {
-            return true;
-        }
+    $body = json_encode($payload, JSON_UNESCAPED_UNICODE);
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_HTTPHEADER => $headers, CURLOPT_POSTFIELDS => $body, CURLOPT_TIMEOUT => 90]);
+        $raw = curl_exec($ch); $err = curl_error($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+        if ($raw === false || $code >= 400) throw new RuntimeException('HTTP error: ' . $code . ' ' . $err . ' ' . substr((string)$raw, 0, 500));
+    } else {
+        $context = stream_context_create(['http' => ['method' => 'POST', 'header' => implode("\r\n", $headers), 'content' => $body, 'timeout' => 90]]);
+        $raw = file_get_contents($url, false, $context);
+        if ($raw === false) throw new RuntimeException('HTTP request gagal.');
     }
-
-    return false;
+    $json = json_decode($raw, true); if (!is_array($json)) throw new RuntimeException('Response JSON tidak valid.'); return $json;
 }
 
-function isImportant($text)
+function renderList(array $items, $limit = 8)
 {
-    return containsAny($text, [
-        'urgent',
-        'penting',
-        'segera',
-        'komplain',
-        'complain',
-        'refund',
-        'retur',
-        'stok habis',
-        'kosong',
-        'omset',
-        'order',
-        'pesanan',
-        'transfer',
-        'qris',
-        'belum dibayar',
-        'telat',
-        'terlambat',
-        'produksi lagi',
-        'butuh',
-        'masalah',
-        'error',
-        'gagal'
-    ]);
+    if (empty($items)) return '<div class="muted">Tidak ada item.</div>';
+    $html = '<ul class="compact">';
+    foreach (array_slice($items, 0, $limit) as $it) {
+        $html .= '<li><b>' . e($it['group']) . '</b> / ' . e($it['topic']) . ' — ' . e($it['text']) . '<br><span class="muted">' . e($it['time']) . ' · ' . e($it['sender']) . '</span></li>';
+    }
+    $html .= '</ul>'; return $html;
 }
-
-function makeActionItems(array $summary)
-{
-    $actions = [];
-
-    if (count($summary['complaints']) > 0) {
-        $actions[] = [
-            'priority' => 'Tinggi',
-            'text' => 'Review dan follow-up komplain/customer bermasalah.',
-            'count' => count($summary['complaints'])
-        ];
-    }
-
-    if (count($summary['stock']) > 0) {
-        $actions[] = [
-            'priority' => 'Sedang',
-            'text' => 'Cek stok dan kebutuhan produksi/restock.',
-            'count' => count($summary['stock'])
-        ];
-    }
-
-    if (count($summary['payments']) > 0) {
-        $actions[] = [
-            'priority' => 'Sedang',
-            'text' => 'Verifikasi pembayaran/transfer/QRIS yang disebut di grup.',
-            'count' => count($summary['payments'])
-        ];
-    }
-
-    if (count($summary['orders']) > 0) {
-        $actions[] = [
-            'priority' => 'Sedang',
-            'text' => 'Rekap order/pesanan dan pastikan status fulfillment.',
-            'count' => count($summary['orders'])
-        ];
-    }
-
-    if (count($summary['delivery']) > 0) {
-        $actions[] = [
-            'priority' => 'Rendah',
-            'text' => 'Cek pengiriman, kurir, ongkir, dan keterlambatan delivery.',
-            'count' => count($summary['delivery'])
-        ];
-    }
-
-    if (empty($actions)) {
-        $actions[] = [
-            'priority' => 'Rendah',
-            'text' => 'Tidak ada action item spesifik berdasarkan keyword lokal.',
-            'count' => 0
-        ];
-    }
-
-    return $actions;
-}
-
-function extractKeyActionsPlain($summaryText)
-{
-    $lines = explode("\n", (string)$summaryText);
-    $capture = false;
-    $actions = [];
-
-    foreach ($lines as $line) {
-        $trim = trim($line);
-
-        if (stripos($trim, 'ACTION ITEM') !== false) {
-            $capture = true;
-            continue;
-        }
-
-        if ($capture && preg_match('/^\d+\./', $trim)) {
-            break;
-        }
-
-        if ($capture && $trim !== '') {
-            $actions[] = $trim;
-        }
-    }
-
-    return implode("\n", $actions);
-}
-
-function e($value)
-{
-    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
-}
-
-function showItems(array $items, $limit = 10)
-{
-    if (empty($items)) {
-        echo '<div class="muted">Tidak ada data.</div>';
-        return;
-    }
-
-    echo '<ul class="item-list">';
-
-    foreach (array_slice($items, 0, $limit) as $item) {
-        echo '<li>';
-        echo '<div><strong>' . e($item['group']) . '</strong> <span class="muted">[' . e($item['time']) . ']</span></div>';
-        echo '<div class="muted">Pengirim: ' . e($item['sender']) . ' · Kategori: ' . e($item['category']) . '</div>';
-        echo '<div>' . e($item['text']) . '</div>';
-        echo '</li>';
-    }
-
-    echo '</ul>';
-
-    if (count($items) > $limit) {
-        echo '<div class="muted">+' . (count($items) - $limit) . ' item lain tidak ditampilkan.</div>';
-    }
-}
-
 ?>
 <!doctype html>
 <html lang="id">
 <head>
-    <meta charset="utf-8">
-    <title>Telegram Summary Agent</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background: #f5f5f5;
-            color: #222;
-            margin: 0;
-            padding: 20px;
-        }
-
-        .container {
-            max-width: 1150px;
-            margin: auto;
-        }
-
-        h1 {
-            margin-bottom: 4px;
-        }
-
-        h2 {
-            margin-top: 0;
-            font-size: 20px;
-        }
-
-        .subtitle {
-            color: #666;
-            margin-bottom: 20px;
-        }
-
-        .topnav {
-            margin-bottom: 12px;
-        }
-
-        .topnav a {
-            color: #222;
-            text-decoration: none;
-            margin-right: 12px;
-            font-size: 14px;
-        }
-
-        .card {
-            background: #fff;
-            border-radius: 10px;
-            padding: 16px;
-            margin-bottom: 16px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        }
-
-        form {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            align-items: end;
-        }
-
-        label {
-            font-size: 13px;
-            color: #555;
-            display: block;
-            margin-bottom: 4px;
-        }
-
-        select, button {
-            padding: 9px 10px;
-            border-radius: 7px;
-            border: 1px solid #ccc;
-            font-size: 14px;
-            background: #fff;
-        }
-
-        button {
-            background: #222;
-            color: #fff;
-            border: none;
-            cursor: pointer;
-        }
-
-        .button-local {
-            background: #222;
-        }
-
-        .button-ai {
-            background: #0f766e;
-        }
-
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 12px;
-        }
-
-        .stat {
-            background: #fff;
-            border-radius: 10px;
-            padding: 14px;
-            border: 1px solid #eee;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-        }
-
-        .stat-value {
-            font-size: 26px;
-            font-weight: bold;
-        }
-
-        .stat-label {
-            color: #666;
-            font-size: 13px;
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 5px 9px;
-            background: #eef2ff;
-            border-radius: 999px;
-            font-size: 13px;
-            margin: 3px;
-        }
-
-        .priority-high {
-            background: #ffe9e9;
-        }
-
-        .priority-medium {
-            background: #fff6d8;
-        }
-
-        .priority-low {
-            background: #eaf7ea;
-        }
-
-        .muted {
-            color: #777;
-            font-size: 13px;
-        }
-
-        .item-list {
-            padding-left: 20px;
-            margin-top: 8px;
-        }
-
-        .item-list li {
-            margin-bottom: 12px;
-            line-height: 1.45;
-        }
-
-        .summary-box {
-            white-space: pre-wrap;
-            line-height: 1.55;
-            font-size: 15px;
-        }
-
-        .error-box {
-            background: #fff3f3;
-            color: #8a1f1f;
-            border: 1px solid #ffc9c9;
-            padding: 12px;
-            border-radius: 8px;
-        }
-
-        .success-box {
-            background: #effaf5;
-            color: #14532d;
-            border: 1px solid #bbf7d0;
-            padding: 12px;
-            border-radius: 8px;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 14px;
-        }
-
-        th, td {
-            text-align: left;
-            padding: 9px;
-            border-bottom: 1px solid #eee;
-            vertical-align: top;
-        }
-
-        th {
-            background: #fafafa;
-            color: #555;
-        }
-
-        @media (max-width: 900px) {
-            .grid {
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-            }
-        }
-
-        @media (max-width: 600px) {
-            body {
-                padding: 10px;
-            }
-
-            .grid {
-                grid-template-columns: 1fr;
-            }
-        }
-    </style>
+<meta charset="utf-8">
+<title>Telegram Adena Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:Arial,sans-serif;background:#f4f6f8;color:#222;margin:0;padding:20px}.container{max-width:1280px;margin:auto}h1{margin:0 0 4px}.subtitle,.muted{color:#667085;font-size:13px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}.card{background:#fff;border-radius:12px;padding:16px;margin-bottom:14px;box-shadow:0 2px 10px rgba(0,0,0,.06)}.metric{font-size:28px;font-weight:bold;margin-top:6px}form{display:flex;gap:10px;flex-wrap:wrap;align-items:end}label{font-size:13px;color:#555;display:block;margin-bottom:4px}select,button,a.button{padding:9px 10px;border-radius:8px;border:1px solid #ccc;background:#fff;font-size:14px}button,a.button{background:#111;color:#fff;border:none;text-decoration:none;cursor:pointer}.reset{color:#555;text-decoration:none;font-size:14px}.badge{display:inline-block;border-radius:999px;padding:4px 8px;background:#eef2ff;font-size:12px;margin:2px}.compact{margin:8px 0 0 18px;padding:0}.compact li{margin-bottom:8px;line-height:1.4}table{width:100%;border-collapse:collapse;font-size:14px}th,td{border-bottom:1px solid #eee;padding:9px;text-align:left;vertical-align:top}pre{white-space:pre-wrap;line-height:1.5;background:#101828;color:#f2f4f7;padding:14px;border-radius:10px;overflow:auto}.alert{background:#fff3cd;border:1px solid #ffe69c;color:#664d03;border-radius:10px;padding:12px;margin-bottom:12px}@media(max-width:900px){.grid,.grid2{grid-template-columns:1fr}body{padding:10px}}
+</style>
 </head>
 <body>
-
 <div class="container">
-
-    <div class="topnav">
-        <a href="messages.php">← Lihat Pesan</a>
-        <a href="summary.php">Summary</a>
-    </div>
-
-    <h1>Telegram Summary Agent</h1>
-    <div class="subtitle">
-        Summary lokal selalu tersedia. Summary AI aktif bila OpenAI API dan billing tersedia.
+    <div class="card">
+        <h1>Telegram Adena Dashboard</h1>
+        <div class="subtitle">Rangkuman teks + gambar/foto struk dari semua group dan semua topik.</div>
+        <p><a class="button" href="messages.php<?= e(u($token)) ?>">Lihat Pesan</a></p>
     </div>
 
     <div class="card">
         <form method="get">
-            <div>
-                <label>Periode</label>
-                <select name="period">
-                    <option value="today" <?= $period === 'today' ? 'selected' : '' ?>>Hari ini</option>
-                    <option value="yesterday" <?= $period === 'yesterday' ? 'selected' : '' ?>>Kemarin</option>
-                    <option value="week" <?= $period === 'week' ? 'selected' : '' ?>>7 hari terakhir</option>
-                </select>
-            </div>
-
-            <div>
-                <label>Grup</label>
-                <select name="group_id">
-                    <option value="">Semua grup</option>
-                    <?php foreach ($groups as $group): ?>
-                        <option value="<?= e($group['telegram_chat_id']) ?>"
-                            <?= ((string)$groupId === (string)$group['telegram_chat_id']) ? 'selected' : '' ?>>
-                            <?= e($group['group_name'] ?: $group['telegram_chat_id']) ?>
-                        </option>
-                    <?php endforeach; ?>
-                </select>
-            </div>
-
-            <div>
-                <button class="button-local" type="submit">Tampilkan Summary Lokal</button>
-            </div>
+            <input type="hidden" name="token" value="<?= e($token) ?>">
+            <div><label>Periode</label><select name="period"><option value="today" <?= $period==='today'?'selected':'' ?>>Hari ini</option><option value="yesterday" <?= $period==='yesterday'?'selected':'' ?>>Kemarin</option><option value="7days" <?= $period==='7days'?'selected':'' ?>>7 hari</option><option value="month" <?= $period==='month'?'selected':'' ?>>Bulan ini</option></select></div>
+            <div><label>Group</label><select name="group_id"><option value="">Semua group</option><?php foreach($groups as $g): ?><option value="<?= e($g['telegram_chat_id']) ?>" <?= (string)$groupId===(string)$g['telegram_chat_id']?'selected':'' ?>><?= e($g['group_name'] ?: $g['telegram_chat_id']) ?></option><?php endforeach; ?></select></div>
+            <div><label>Topik</label><select name="topic_thread_id"><option value="">Semua topik</option><?php foreach($topics as $t): ?><option value="<?= e($t['message_thread_id']) ?>" <?= (string)$topicThreadId===(string)$t['message_thread_id']?'selected':'' ?>><?= e(($t['group_name'] ? $t['group_name'].' / ' : '').($t['topic_name'] ?: ('Topic #'.$t['message_thread_id']))) ?></option><?php endforeach; ?></select></div>
+            <div><label>Tipe</label><select name="message_type"><option value="">Semua</option><option value="text" <?= $messageType==='text'?'selected':'' ?>>Teks</option><option value="photo" <?= $messageType==='photo'?'selected':'' ?>>Foto</option></select></div>
+            <button type="submit">Filter</button><a class="reset" href="summary.php<?= e(u($token)) ?>">Reset</a>
         </form>
-    </div>
-
-    <div class="card">
-        <form method="post">
-            <input type="hidden" name="mode" value="ai">
-            <button class="button-ai" type="submit">Buat Summary AI</button>
-        </form>
-        <div class="muted" style="margin-top: 8px;">
-            Jika AI gagal karena quota/billing, summary lokal di bawah tetap dapat digunakan.
-        </div>
-    </div>
-
-    <?php if ($aiError): ?>
-        <div class="card">
-            <div class="error-box">
-                <strong>Summary AI gagal:</strong><br>
-                <?= e($aiError) ?><br><br>
-                Summary lokal tetap ditampilkan di bawah.
-            </div>
-        </div>
-    <?php endif; ?>
-
-    <?php if ($aiSummary): ?>
-        <div class="card">
-            <div class="success-box">
-                Summary AI berhasil dibuat dan disimpan ke database.
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Summary AI</h2>
-            <div class="summary-box"><?= e($aiSummary) ?></div>
-        </div>
-    <?php endif; ?>
-
-    <div class="card">
-        <h2>Rangkuman Lokal - <?= e($localSummary['period_label']) ?></h2>
-        <div class="muted">
-            Rentang: <?= e($localSummary['date_start']) ?> s.d. <?= e($localSummary['date_end']) ?>
-        </div>
     </div>
 
     <div class="grid">
-        <div class="stat">
-            <div class="stat-value"><?= e($localSummary['total_messages']) ?></div>
-            <div class="stat-label">Total pesan</div>
-        </div>
-
-        <div class="stat">
-            <div class="stat-value"><?= e(count($localSummary['orders'])) ?></div>
-            <div class="stat-label">Pesan order</div>
-        </div>
-
-        <div class="stat">
-            <div class="stat-value"><?= e(count($localSummary['omset'])) ?></div>
-            <div class="stat-label">Pesan omset</div>
-        </div>
-
-        <div class="stat">
-            <div class="stat-value"><?= e(count($localSummary['complaints'])) ?></div>
-            <div class="stat-label">Komplain/risiko</div>
-        </div>
+        <div class="card"><div class="muted">Total pesan</div><div class="metric"><?= e($localSummary['total_messages']) ?></div></div>
+        <div class="card"><div class="muted">Foto/gambar</div><div class="metric"><?= e($localSummary['photo_messages']) ?></div></div>
+        <div class="card"><div class="muted">Gambar dianalisa</div><div class="metric"><?= e($localSummary['image_done']) ?></div></div>
+        <div class="card"><div class="muted">Topik terbaca</div><div class="metric"><?= e(count($localSummary['topics'])) ?></div></div>
     </div>
 
+    <div class="grid2">
+        <div class="card"><h3>Kategori</h3><?php foreach($localSummary['categories'] as $cat=>$total): ?><span class="badge"><?= e(ucfirst($cat)) ?>: <?= e($total) ?></span><?php endforeach; if(empty($localSummary['categories'])): ?><div class="muted">Belum ada data.</div><?php endif; ?></div>
+        <div class="card"><h3>Status Analisa Gambar</h3><span class="badge">Done: <?= e($localSummary['image_done']) ?></span><span class="badge">Skipped: <?= e($localSummary['image_skipped']) ?></span><span class="badge">Error: <?= e($localSummary['image_error']) ?></span></div>
+    </div>
+
+    <div class="card"><h3>Ringkasan per Group</h3><table><tr><th>Group</th><th>Pesan</th><th>Foto</th><th>Topik</th><th>Kategori dominan</th></tr><?php foreach($localSummary['groups'] as $name=>$g): arsort($g['categories']); ?><tr><td><?= e($name) ?></td><td><?= e($g['total']) ?></td><td><?= e($g['photos']) ?></td><td><?php foreach($g['topics'] as $tn=>$ct): ?><span class="badge"><?= e($tn) ?>: <?= e($ct) ?></span><?php endforeach; ?></td><td><?php foreach(array_slice($g['categories'],0,3,true) as $cat=>$ct): ?><span class="badge"><?= e($cat) ?>: <?= e($ct) ?></span><?php endforeach; ?></td></tr><?php endforeach; ?></table></div>
+
+    <div class="card"><h3>Ringkasan per Topik</h3><table><tr><th>Group / Topik</th><th>Pesan</th><th>Foto</th><th>Kategori</th></tr><?php foreach($localSummary['topics'] as $name=>$t): arsort($t['categories']); ?><tr><td><?= e($name) ?></td><td><?= e($t['total']) ?></td><td><?= e($t['photos']) ?></td><td><?php foreach(array_slice($t['categories'],0,4,true) as $cat=>$ct): ?><span class="badge"><?= e($cat) ?>: <?= e($ct) ?></span><?php endforeach; ?></td></tr><?php endforeach; ?></table></div>
+
+    <div class="grid2">
+        <div class="card"><h3>Order/Pesanan</h3><?= renderList($localSummary['orders']) ?></div>
+        <div class="card"><h3>Omset/Pembayaran</h3><?= renderList(array_merge($localSummary['omset'],$localSummary['payments'])) ?></div>
+        <div class="card"><h3>Stok/Produksi</h3><?= renderList($localSummary['stock']) ?></div>
+        <div class="card"><h3>Komplain/Risiko</h3><?= renderList($localSummary['complaints']) ?></div>
+    </div>
+
+    <div class="card"><h3>Foto/Struk Terdeteksi</h3><?= renderList($localSummary['images'], 12) ?></div>
+
     <div class="card">
-        <h2>Distribusi Kategori</h2>
-        <?php if (empty($localSummary['categories'])): ?>
-            <div class="muted">Belum ada kategori.</div>
-        <?php else: ?>
-            <?php foreach ($localSummary['categories'] as $cat => $total): ?>
-                <span class="badge"><?= e($cat) ?>: <?= e($total) ?></span>
-            <?php endforeach; ?>
+        <h3>AI Summary</h3>
+        <?php if($aiError): ?><div class="alert"><?= e($aiError) ?></div><?php endif; ?>
+        <?php if($aiSummary): ?><pre><?= e($aiSummary) ?></pre><?php else: ?>
+            <form method="post"><input type="hidden" name="token" value="<?= e($token) ?>"><input type="hidden" name="mode" value="ai"><button type="submit">Buat AI Summary</button></form>
+            <div class="muted">AI membaca teks + hasil analisa gambar dari semua topik sesuai filter.</div>
         <?php endif; ?>
     </div>
-
-    <div class="card">
-        <h2>Ringkasan Per Grup</h2>
-
-        <?php if (empty($localSummary['groups'])): ?>
-            <div class="muted">Belum ada pesan pada periode ini.</div>
-        <?php else: ?>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Grup</th>
-                        <th>Total Pesan</th>
-                        <th>Kategori Dominan</th>
-                        <th>Pesan Penting</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach ($localSummary['groups'] as $groupName => $group): ?>
-                        <?php
-                        arsort($group['categories']);
-                        $dominant = [];
-                        foreach (array_slice($group['categories'], 0, 3, true) as $cat => $total) {
-                            $dominant[] = $cat . ' (' . $total . ')';
-                        }
-                        ?>
-                        <tr>
-                            <td><?= e($groupName) ?></td>
-                            <td><?= e($group['total']) ?></td>
-                            <td><?= e(implode(', ', $dominant)) ?></td>
-                            <td><?= e(count($group['important'])) ?></td>
-                        </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        <?php endif; ?>
-    </div>
-
-    <div class="card">
-        <h2>Action Item Lokal</h2>
-        <?php foreach ($localSummary['action_items'] as $action): ?>
-            <?php
-            $class = 'priority-low';
-            if ($action['priority'] === 'Tinggi') {
-                $class = 'priority-high';
-            } elseif ($action['priority'] === 'Sedang') {
-                $class = 'priority-medium';
-            }
-            ?>
-            <div class="badge <?= e($class) ?>">
-                [<?= e($action['priority']) ?>] <?= e($action['text']) ?>
-                <?php if ($action['count'] > 0): ?>
-                    — <?= e($action['count']) ?> item
-                <?php endif; ?>
-            </div>
-        <?php endforeach; ?>
-    </div>
-
-    <div class="card">
-        <h2>Order / Pesanan</h2>
-        <?php showItems($localSummary['orders'], 10); ?>
-    </div>
-
-    <div class="card">
-        <h2>Omset / Penjualan</h2>
-        <?php showItems($localSummary['omset'], 10); ?>
-    </div>
-
-    <div class="card">
-        <h2>Stok / Produksi</h2>
-        <?php showItems($localSummary['stock'], 10); ?>
-    </div>
-
-    <div class="card">
-        <h2>Komplain / Risiko Operasional</h2>
-        <?php showItems($localSummary['complaints'], 10); ?>
-    </div>
-
-    <div class="card">
-        <h2>Pembayaran</h2>
-        <?php showItems($localSummary['payments'], 10); ?>
-    </div>
-
-    <div class="card">
-        <h2>Pengiriman</h2>
-        <?php showItems($localSummary['delivery'], 10); ?>
-    </div>
-
-    <div class="card">
-        <h2>News / Info Penting</h2>
-        <?php showItems($localSummary['news'], 10); ?>
-    </div>
-
-    <div class="card">
-        <h2>Pesan Penting Terdeteksi</h2>
-        <?php showItems($localSummary['important_messages'], 20); ?>
-    </div>
-
 </div>
-
 </body>
 </html>
