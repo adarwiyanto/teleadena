@@ -1,0 +1,26 @@
+==== 2026-05-31 16:04:44 ====
+
+
+==== 2026-05-31 16:15:01 ====
+{"update_id":513872045,
+"edited_message":{"message_id":36035,"from":{"id":1271786926,"is_bot":false,"first_name":"Musbihatul munawiroh","username":"Musbihatulmnwrh"},"chat":{"id":-1001778398255,"title":"Adena Belitung","is_forum":true,"type":"supergroup"},"date":1780218610,"edit_date":1780218901,"message_thread_id":12,"reply_to_message":{"message_id":12,"from":{"id":215383550,"is_bot":false,"first_name":"Agus","username":"dr_Agus"},"chat":{"id":-1001778398255,"title":"Adena Belitung","is_forum":true,"type":"supergroup"},"date":1688521021,"message_thread_id":12,"forum_topic_created":{"name":"Stok Barang Masuk","icon_color":13338331},"is_topic_message":true},"text":"+ pempek cumi 10","is_topic_message":true}}
+
+==== 2026-05-31 16:23:28 ====
+
+
+==== 2026-05-31 16:24:17 ====
+{"update_id":513872046,
+"message":{"message_id":36036,"from":{"id":215383550,"is_bot":false,"first_name":"Agus","username":"dr_Agus"},"chat":{"id":-1001778398255,"title":"Adena Belitung","is_forum":true,"type":"supergroup"},"date":1780219458,"text":"Tes database. Order ketam isi 10 box. Omset sementara 1.200.000. Stok aman."}}
+
+==== 2026-05-31 16:46:14 ====
+{"update_id":513872047,
+"message":{"message_id":3,"from":{"id":215383550,"is_bot":false,"first_name":"Agus","username":"dr_Agus","language_code":"en"},"chat":{"id":215383550,"first_name":"Agus","username":"dr_Agus","type":"private"},"date":1780220774,"text":"/start","entities":[{"offset":0,"length":6,"type":"bot_command"}]}}
+
+==== 2026-05-31 16:46:31 ====
+{"update_id":513872048,
+"message":{"message_id":4,"from":{"id":215383550,"is_bot":false,"first_name":"Agus","username":"dr_Agus","language_code":"en"},"chat":{"id":215383550,"first_name":"Agus","username":"dr_Agus","type":"private"},"date":1780220791,"text":"tes admin"}}
+
+==== 2026-05-31 16:54:15 ====
+{"update_id":513872049,
+"message":{"message_id":36037,"from":{"id":6385146016,"is_bot":false,"first_name":"Wiwit","last_name":"SY"},"chat":{"id":-1001778398255,"title":"Adena Belitung","is_forum":true,"type":"supergroup"},"date":1780221254,"message_thread_id":20256,"reply_to_message":{"message_id":20256,"from":{"id":6385146016,"is_bot":false,"first_name":"Wiwit","last_name":"SY"},"chat":{"id":-1001778398255,"title":"Adena Belitung","is_forum":true,"type":"supergroup"},"date":1731378096,"message_thread_id":20256,"forum_topic_created":{"name":"Fee guide","icon_color":16766590},"is_topic_message":true},"photo":[{"file_id":"AgACAgUAAx0CagABNC8AAozFahwFRrkgz7_AkhQnfUHwKHI8GBcAAikPaxviYeBUuOI-i7Gt8KoBAAMCAANzAAM7BA","file_unique_id":"AQADKQ9rG-Jh4FR4","file_size":482,"width":90,"height":16},{"file_id":"AgACAgUAAx0CagABNC8AAozFahwFRrkgz7_AkhQnfUHwKHI8GBcAAikPaxviYeBUuOI-i7Gt8KoBAAMCAANtAAM7BA","file_unique_id":"AQADKQ9rG-Jh4FRy","file_size":4058,"width":320,"height":56},{"file_id":"AgACAgUAAx0CagABNC8AAozFahwFRrkgz7_AkhQnfUHwKHI8GBcAAikPaxviYeBUuOI-i7Gt8KoBAAMCAAN4AAM7BA","file_unique_id":"AQADKQ9rG-Jh4FR9","file_size":16036,"width":800,"height":139},{"file_id":"AgACAgUAAx0CagABNC8AAozFahwFRrkgz7_AkhQnfUHwKHI8GBcAAikPaxviYeBUuOI-i7Gt8KoBAAMCAAN5AAM7BA","file_unique_id":"AQADKQ9rG-Jh4FR-","file_size":23786,"width":1179,"height":205}],"is_topic_message":true}}
+

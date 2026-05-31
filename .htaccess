@@ -1,0 +1,5 @@
+<FilesMatch "^(config\.php|auth\.php|telegram_log\.txt|telegram_error_log\.txt)$">
+    Require all denied
+</FilesMatch>
+
+Options -Indexes
