@@ -120,8 +120,24 @@ function getKnownTopicName(PDO $pdo, $chatId, $threadId)
 
 function upsertTopic(PDO $pdo, $chatId, $threadId, $topicName, $seenAt)
 {
-    $stmt = $pdo->prepare("\n        INSERT INTO telegram_topics (telegram_chat_id, message_thread_id, topic_name, first_seen_at, last_seen_at)\n        VALUES (:chat_id, :thread_id, :topic_name, :seen_at, :seen_at)\n        ON DUPLICATE KEY UPDATE\n            topic_name = VALUES(topic_name),\n            last_seen_at = VALUES(last_seen_at),\n            updated_at = CURRENT_TIMESTAMP\n    ");
-    $stmt->execute([':chat_id'=>$chatId, ':thread_id'=>$threadId ?: 0, ':topic_name'=>$topicName, ':seen_at'=>$seenAt ?: date('Y-m-d H:i:s')]);
+    // Gunakan placeholder berbeda untuk first_seen_at dan last_seen_at.
+    // Beberapa konfigurasi PDO MySQL tidak mengizinkan pemakaian ulang named placeholder yang sama dalam satu statement.
+    $normalizedSeenAt = $seenAt ?: date('Y-m-d H:i:s');
+    $stmt = $pdo->prepare("
+        INSERT INTO telegram_topics (telegram_chat_id, message_thread_id, topic_name, first_seen_at, last_seen_at)
+        VALUES (:chat_id, :thread_id, :topic_name, :first_seen_at, :last_seen_at)
+        ON DUPLICATE KEY UPDATE
+            topic_name = VALUES(topic_name),
+            last_seen_at = VALUES(last_seen_at),
+            updated_at = CURRENT_TIMESTAMP
+    " );
+    $stmt->execute([
+        ':chat_id' => $chatId,
+        ':thread_id' => $threadId ?: 0,
+        ':topic_name' => $topicName,
+        ':first_seen_at' => $normalizedSeenAt,
+        ':last_seen_at' => $normalizedSeenAt,
+    ]);
 }
 
 function detectCategory($text)
