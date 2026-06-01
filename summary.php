@@ -63,7 +63,10 @@ try {
 }
 
 function e($value) { return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8'); }
-function u($token, array $params = []) { return '?' . http_build_query(array_merge(['token' => $token], $params)); }
+function u($token, array $params = []) {
+    if (function_exists('hasValidAccessToken') && hasValidAccessToken()) return '?' . http_build_query(array_merge(['token' => $token], $params));
+    return $params ? ('?' . http_build_query($params)) : '';
+}
 
 function resolvePeriod($period)
 {
@@ -249,7 +252,7 @@ body{font-family:Arial,sans-serif;background:#f4f6f8;color:#222;margin:0;padding
     <div class="card">
         <h1>Telegram Adena Dashboard</h1>
         <div class="subtitle">Rangkuman teks + gambar/foto struk dari semua group dan semua topik.</div>
-        <p><a class="button" href="messages.php<?= e(u($token)) ?>">Lihat Pesan</a></p>
+        <p><a class="button" href="messages.php<?= e(u($token)) ?>">Lihat Pesan</a> <a class="button" href="logout.php">Logout</a></p>
     </div>
 
     <div class="card">

@@ -49,7 +49,10 @@ try {
 }
 
 function e($value) { return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8'); }
-function u($token, array $params = []) { return '?' . http_build_query(array_merge(['token' => $token], $params)); }
+function u($token, array $params = []) {
+    if (function_exists('hasValidAccessToken') && hasValidAccessToken()) return '?' . http_build_query(array_merge(['token' => $token], $params));
+    return $params ? ('?' . http_build_query($params)) : '';
+}
 function categoryBadge($category)
 {
     $labels = ['omset'=>'Omset','order'=>'Order','komplain'=>'Komplain','stok'=>'Stok','pembayaran'=>'Pembayaran','pengiriman'=>'Pengiriman','news'=>'News','umum'=>'Umum'];
@@ -78,7 +81,7 @@ body{font-family:Arial,sans-serif;background:#f5f5f5;color:#222;margin:0;padding
     <div class="card">
         <h1>Telegram Messages</h1>
         <div class="subtitle">Pesan mentah + topik + media + hasil analisa gambar.</div>
-        <p><a class="button" href="summary.php<?= e(u($token)) ?>">Dashboard Summary</a></p>
+        <p><a class="button" href="summary.php<?= e(u($token)) ?>">Dashboard Summary</a> <a class="button" href="logout.php">Logout</a></p>
     </div>
 
     <div class="card">

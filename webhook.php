@@ -49,6 +49,12 @@ try {
     $messageDate = !empty($message['date']) ? date('Y-m-d H:i:s', (int)$message['date']) : date('Y-m-d H:i:s');
 
     $pdo = db();
+
+    if (isDashboardSetupCommand($captionOrText)) {
+        handleDashboardSetupCommand($pdo, $chatId, $senderId);
+        ok('DASHBOARD SETUP LINK SENT');
+    }
+
     saveGroup($pdo, $chatId, $chatTitle, $chatType);
 
     if ($topicName === null) {
@@ -149,13 +155,57 @@ function saveGroup(PDO $pdo, $chatId, $chatTitle, $chatType)
 
 function upsertTopic(PDO $pdo, $chatId, $threadId, $topicName, $seenAt)
 {
-    $stmt = $pdo->prepare("\n        INSERT INTO telegram_topics (telegram_chat_id, message_thread_id, topic_name, first_seen_at, last_seen_at)\n        VALUES (:chat_id, :thread_id, :topic_name, :seen_at, :seen_at)\n        ON DUPLICATE KEY UPDATE\n            topic_name = VALUES(topic_name),\n            last_seen_at = VALUES(last_seen_at),\n            updated_at = CURRENT_TIMESTAMP\n    ");
+    $stmt = $pdo->prepare("\n        INSERT INTO telegram_topics (telegram_chat_id, message_thread_id, topic_name, first_seen_at, last_seen_at)\n        VALUES (:chat_id, :thread_id, :topic_name, :first_seen_at, :last_seen_at)\n        ON DUPLICATE KEY UPDATE\n            topic_name = VALUES(topic_name),\n            last_seen_at = VALUES(last_seen_at),\n            updated_at = CURRENT_TIMESTAMP\n    ");
     $stmt->execute([
         ':chat_id' => $chatId,
         ':thread_id' => $threadId ?: 0,
         ':topic_name' => $topicName,
-        ':seen_at' => $seenAt,
+        ':first_seen_at' => $seenAt,
+        ':last_seen_at' => $seenAt,
     ]);
+}
+
+function isDashboardSetupCommand($text)
+{
+    $text = trim((string)$text);
+    return preg_match('/^\/(dashboard_user|dashboard_reset)(@\w+)?(\s|$)/i', $text) === 1;
+}
+
+function handleDashboardSetupCommand(PDO $pdo, $chatId, $senderId)
+{
+    if (defined('TELEGRAM_ADMIN_CHAT_ID') && trim((string)TELEGRAM_ADMIN_CHAT_ID) !== '') {
+        $allowed = array_map('trim', explode(',', (string)TELEGRAM_ADMIN_CHAT_ID));
+        if (!in_array((string)$chatId, $allowed, true) && !in_array((string)$senderId, $allowed, true)) {
+            sendTelegramMessage($chatId, 'Command dashboard hanya untuk admin.');
+            return;
+        }
+    }
+
+    if (!defined('APP_BASE_URL') || trim((string)APP_BASE_URL) === '') {
+        sendTelegramMessage($chatId, 'APP_BASE_URL belum diatur di config.php. Isi contoh: https://domain.com/telegram');
+        return;
+    }
+
+    $token = bin2hex(random_bytes(32));
+    $minutes = defined('DASHBOARD_SETUP_TOKEN_EXPIRE_MINUTES') ? (int)DASHBOARD_SETUP_TOKEN_EXPIRE_MINUTES : 30;
+    if ($minutes < 5) $minutes = 5;
+    $expiresAt = (new DateTime('now'))->modify('+' . $minutes . ' minutes')->format('Y-m-d H:i:s');
+
+    $stmt = $pdo->prepare("\n        INSERT INTO telegram_dashboard_setup_tokens
+            (token, requested_by_chat_id, requested_by_user_id, expires_at)
+        VALUES
+            (:token, :chat_id, :user_id, :expires_at)
+    " );
+    $stmt->execute([
+        ':token' => $token,
+        ':chat_id' => (string)$chatId,
+        ':user_id' => $senderId !== null ? (string)$senderId : null,
+        ':expires_at' => $expiresAt,
+    ]);
+
+    $url = rtrim((string)APP_BASE_URL, '/') . '/setup_user.php?token=' . rawurlencode($token);
+    $message = "Link buat/reset user dashboard Telegram Adena:\n" . $url . "\n\nBerlaku {$minutes} menit dan satu kali pakai. Password dibuat di halaman web, tidak dikirim lewat Telegram.";
+    sendTelegramMessage($chatId, $message);
 }
 
 function getKnownTopicName(PDO $pdo, $chatId, $threadId)
@@ -333,6 +383,40 @@ function detectCategory($text)
         }
     }
     return 'umum';
+}
+
+function sendTelegramMessage($chatId, $text)
+{
+    if (!defined('TELEGRAM_BOT_TOKEN') || trim((string)TELEGRAM_BOT_TOKEN) === '') {
+        return;
+    }
+    $url = 'https://api.telegram.org/bot' . TELEGRAM_BOT_TOKEN . '/sendMessage';
+    $payload = http_build_query([
+        'chat_id' => $chatId,
+        'text' => $text,
+        'disable_web_page_preview' => 1,
+    ]);
+
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_TIMEOUT => 20,
+        ]);
+        curl_exec($ch);
+        curl_close($ch);
+        return;
+    }
+
+    $context = stream_context_create(['http' => [
+        'method' => 'POST',
+        'header' => 'Content-Type: application/x-www-form-urlencoded',
+        'content' => $payload,
+        'timeout' => 20,
+    ]]);
+    @file_get_contents($url, false, $context);
 }
 
 function jsonRequest($url)

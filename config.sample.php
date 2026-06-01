@@ -21,8 +21,12 @@ define('TELEGRAM_BOT_TOKEN', '');
 define('TELEGRAM_ADMIN_CHAT_ID', '');
 
 // Akses dashboard dan cron
-define('APP_ACCESS_TOKEN', 'ganti-token-dashboard');
+define('APP_ACCESS_TOKEN', 'ganti-token-dashboard'); // tetap didukung untuk akses lama via ?token=...
 define('CRON_ACCESS_TOKEN', 'ganti-token-cron');
+
+// URL folder aplikasi Telegram, dipakai bot untuk mengirim link setup user dashboard.
+define('APP_BASE_URL', 'https://domain.com/telegram');
+define('DASHBOARD_SETUP_TOKEN_EXPIRE_MINUTES', 30);
 
 // Upload foto Telegram untuk analisa gambar/struk
 define('TELEGRAM_UPLOAD_DIR', __DIR__ . '/uploads/telegram');
