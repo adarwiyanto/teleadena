@@ -1,7 +1,7 @@
 <?php
 
 // webhook.php
-// Menerima pesan dari Telegram, menyimpan semua topik/forum, dan menganalisa foto/struk jika tersedia.
+// Menerima update Telegram, menyimpan semua pesan/topik forum, dan menganalisa foto/struk jika tersedia.
 
 require_once __DIR__ . '/config.php';
 
@@ -17,15 +17,17 @@ try {
         ok('NO DATA');
     }
 
-    $updateId = $update['update_id'] ?? null;
-    $message = $update['message'] ?? $update['edited_message'] ?? $update['channel_post'] ?? null;
-
-    if (!$message) {
+    $messageEnvelope = extractTelegramMessageEnvelope($update);
+    if (!$messageEnvelope) {
         ok('NO MESSAGE');
     }
 
+    $updateId = $update['update_id'] ?? null;
+    $message = $messageEnvelope['message'];
+    $updateType = $messageEnvelope['type'];
+
     $chat = $message['chat'] ?? [];
-    $from = $message['from'] ?? [];
+    $from = $message['from'] ?? ($message['sender_chat'] ?? []);
 
     $chatId = $chat['id'] ?? null;
     if (!$chatId) {
@@ -35,17 +37,18 @@ try {
     $chatTitle = $chat['title'] ?? ($chat['first_name'] ?? null);
     $chatType = $chat['type'] ?? null;
     $messageId = $message['message_id'] ?? null;
-    $messageThreadId = $message['message_thread_id'] ?? null;
-    $messageThreadIdForTopic = $messageThreadId ?: 0;
+    $messageThreadId = normalizeThreadId($message['message_thread_id'] ?? null);
 
     $senderId = $from['id'] ?? null;
     $senderName = trim(implode(' ', array_filter([$from['first_name'] ?? null, $from['last_name'] ?? null])));
+    if ($senderName === '' && !empty($from['title'])) {
+        $senderName = $from['title'];
+    }
     $senderUsername = $from['username'] ?? null;
 
-    $captionOrText = $message['text'] ?? ($message['caption'] ?? null);
+    $captionOrText = getMessageText($message);
     $messageType = detectMessageType($message, $captionOrText);
     $topicName = detectTopicName($message);
-
     $messageDate = !empty($message['date']) ? date('Y-m-d H:i:s', (int)$message['date']) : date('Y-m-d H:i:s');
 
     $pdo = db();
@@ -58,12 +61,12 @@ try {
     saveGroup($pdo, $chatId, $chatTitle, $chatType);
 
     if ($topicName === null) {
-        $topicName = getKnownTopicName($pdo, $chatId, $messageThreadIdForTopic);
+        $topicName = getKnownTopicName($pdo, $chatId, $messageThreadId);
     }
     if ($topicName === null) {
-        $topicName = $messageThreadIdForTopic === 0 ? 'General / Topik Umum' : 'Topic #' . $messageThreadIdForTopic;
+        $topicName = $messageThreadId === 0 ? 'General / Topik Umum' : 'Topic #' . $messageThreadId;
     }
-    upsertTopic($pdo, $chatId, $messageThreadIdForTopic, $topicName, $messageDate);
+    upsertTopic($pdo, $chatId, $messageThreadId, $topicName, $messageDate);
 
     $media = extractLargestPhoto($message);
     $mediaFileId = $media['file_id'] ?? null;
@@ -98,31 +101,30 @@ try {
     $messageText = buildStoredMessageText($captionOrText, $messageType, $imageAnalysisText);
     $detectedCategory = detectCategory($messageText);
 
-    $stmtMsg = $pdo->prepare("\n        INSERT INTO telegram_messages\n            (\n                telegram_update_id, telegram_chat_id, telegram_message_id, message_thread_id, topic_name,\n                sender_id, sender_name, sender_username, message_text, message_date, message_type,\n                media_file_id, media_file_unique_id, media_file_path, media_local_path, media_public_url,\n                image_analysis_text, image_analysis_status, image_analysis_error, analyzed_at,\n                detected_category, raw_payload\n            )\n        VALUES\n            (\n                :telegram_update_id, :telegram_chat_id, :telegram_message_id, :message_thread_id, :topic_name,\n                :sender_id, :sender_name, :sender_username, :message_text, :message_date, :message_type,\n                :media_file_id, :media_file_unique_id, :media_file_path, :media_local_path, :media_public_url,\n                :image_analysis_text, :image_analysis_status, :image_analysis_error, :analyzed_at,\n                :detected_category, :raw_payload\n            )\n    ");
-
-    $stmtMsg->execute([
-        ':telegram_update_id' => $updateId,
-        ':telegram_chat_id' => $chatId,
-        ':telegram_message_id' => $messageId,
-        ':message_thread_id' => $messageThreadId,
-        ':topic_name' => $topicName,
-        ':sender_id' => $senderId,
-        ':sender_name' => $senderName,
-        ':sender_username' => $senderUsername,
-        ':message_text' => $messageText,
-        ':message_date' => $messageDate,
-        ':message_type' => $messageType,
-        ':media_file_id' => $mediaFileId,
-        ':media_file_unique_id' => $mediaFileUniqueId,
-        ':media_file_path' => $mediaFilePath,
-        ':media_local_path' => $mediaLocalPath,
-        ':media_public_url' => $mediaPublicUrl,
-        ':image_analysis_text' => $imageAnalysisText,
-        ':image_analysis_status' => $imageAnalysisStatus,
-        ':image_analysis_error' => $imageAnalysisError,
-        ':analyzed_at' => $analyzedAt,
-        ':detected_category' => $detectedCategory,
-        ':raw_payload' => $rawData,
+    saveTelegramMessage($pdo, [
+        'telegram_update_id' => $updateId,
+        'telegram_chat_id' => $chatId,
+        'telegram_message_id' => $messageId,
+        'message_thread_id' => $messageThreadId,
+        'topic_name' => $topicName,
+        'sender_id' => $senderId,
+        'sender_name' => $senderName,
+        'sender_username' => $senderUsername,
+        'message_text' => $messageText,
+        'message_date' => $messageDate,
+        'message_type' => $messageType,
+        'media_file_id' => $mediaFileId,
+        'media_file_unique_id' => $mediaFileUniqueId,
+        'media_file_path' => $mediaFilePath,
+        'media_local_path' => $mediaLocalPath,
+        'media_public_url' => $mediaPublicUrl,
+        'image_analysis_text' => $imageAnalysisText,
+        'image_analysis_status' => $imageAnalysisStatus,
+        'image_analysis_error' => $imageAnalysisError,
+        'analyzed_at' => $analyzedAt,
+        'detected_category' => $detectedCategory,
+        'raw_payload' => $rawData,
+        'update_type' => $updateType,
     ]);
 
     ok('OK');
@@ -143,6 +145,35 @@ function logText($filename, $text)
     file_put_contents(__DIR__ . '/' . $filename, $text, FILE_APPEND);
 }
 
+function extractTelegramMessageEnvelope(array $update)
+{
+    foreach (['message', 'edited_message', 'channel_post', 'edited_channel_post'] as $key) {
+        if (!empty($update[$key]) && is_array($update[$key])) {
+            return ['type' => $key, 'message' => $update[$key]];
+        }
+    }
+    return null;
+}
+
+function normalizeThreadId($threadId)
+{
+    if ($threadId === null || $threadId === '' || $threadId === false) {
+        return 0;
+    }
+    return (int)$threadId;
+}
+
+function getMessageText(array $message)
+{
+    if (isset($message['text'])) return $message['text'];
+    if (isset($message['caption'])) return $message['caption'];
+    if (isset($message['forum_topic_created']['name'])) return '[forum topic created] ' . $message['forum_topic_created']['name'];
+    if (isset($message['forum_topic_edited']['name'])) return '[forum topic edited] ' . $message['forum_topic_edited']['name'];
+    if (isset($message['forum_topic_closed'])) return '[forum topic closed]';
+    if (isset($message['forum_topic_reopened'])) return '[forum topic reopened]';
+    return null;
+}
+
 function saveGroup(PDO $pdo, $chatId, $chatTitle, $chatType)
 {
     $stmt = $pdo->prepare("\n        INSERT INTO telegram_groups (telegram_chat_id, group_name, group_type, is_active)\n        VALUES (:telegram_chat_id, :group_name, :group_type, 1)\n        ON DUPLICATE KEY UPDATE\n            group_name = VALUES(group_name),\n            group_type = VALUES(group_type),\n            updated_at = CURRENT_TIMESTAMP\n    ");
@@ -155,14 +186,67 @@ function saveGroup(PDO $pdo, $chatId, $chatTitle, $chatType)
 
 function upsertTopic(PDO $pdo, $chatId, $threadId, $topicName, $seenAt)
 {
-    $stmt = $pdo->prepare("\n        INSERT INTO telegram_topics (telegram_chat_id, message_thread_id, topic_name, first_seen_at, last_seen_at)\n        VALUES (:chat_id, :thread_id, :topic_name, :first_seen_at, :last_seen_at)\n        ON DUPLICATE KEY UPDATE\n            topic_name = VALUES(topic_name),\n            last_seen_at = VALUES(last_seen_at),\n            updated_at = CURRENT_TIMESTAMP\n    ");
+    $stmt = $pdo->prepare("\n        INSERT INTO telegram_topics (telegram_chat_id, message_thread_id, topic_name, first_seen_at, last_seen_at)\n        VALUES (:chat_id, :thread_id, :topic_name, :first_seen_at, :last_seen_at)\n        ON DUPLICATE KEY UPDATE\n            topic_name = CASE\n                WHEN VALUES(topic_name) IS NULL OR VALUES(topic_name) = '' OR VALUES(topic_name) LIKE 'Topic #%'
+                THEN topic_name\n                ELSE VALUES(topic_name)\n            END,\n            last_seen_at = VALUES(last_seen_at),\n            updated_at = CURRENT_TIMESTAMP\n    ");
     $stmt->execute([
         ':chat_id' => $chatId,
-        ':thread_id' => $threadId ?: 0,
+        ':thread_id' => normalizeThreadId($threadId),
         ':topic_name' => $topicName,
         ':first_seen_at' => $seenAt,
         ':last_seen_at' => $seenAt,
     ]);
+}
+
+function saveTelegramMessage(PDO $pdo, array $data)
+{
+    $exists = null;
+    if ($data['telegram_chat_id'] !== null && $data['telegram_message_id'] !== null) {
+        $stmtExists = $pdo->prepare("\n            SELECT id FROM telegram_messages\n            WHERE telegram_chat_id = :chat_id\n              AND telegram_message_id = :message_id\n            LIMIT 1\n        ");
+        $stmtExists->execute([
+            ':chat_id' => $data['telegram_chat_id'],
+            ':message_id' => $data['telegram_message_id'],
+        ]);
+        $exists = $stmtExists->fetch();
+    }
+
+    if ($exists) {
+        $stmt = $pdo->prepare("\n            UPDATE telegram_messages SET\n                telegram_update_id = :telegram_update_id,\n                message_thread_id = :message_thread_id,\n                topic_name = :topic_name,\n                sender_id = :sender_id,\n                sender_name = :sender_name,\n                sender_username = :sender_username,\n                message_text = :message_text,\n                message_date = :message_date,\n                message_type = :message_type,\n                media_file_id = COALESCE(:media_file_id, media_file_id),\n                media_file_unique_id = COALESCE(:media_file_unique_id, media_file_unique_id),\n                media_file_path = COALESCE(:media_file_path, media_file_path),\n                media_local_path = COALESCE(:media_local_path, media_local_path),\n                media_public_url = COALESCE(:media_public_url, media_public_url),\n                image_analysis_text = COALESCE(:image_analysis_text, image_analysis_text),\n                image_analysis_status = COALESCE(:image_analysis_status, image_analysis_status),\n                image_analysis_error = COALESCE(:image_analysis_error, image_analysis_error),\n                analyzed_at = COALESCE(:analyzed_at, analyzed_at),\n                detected_category = :detected_category,\n                raw_payload = :raw_payload\n            WHERE id = :id\n        ");
+        $params = bindMessageParams($data);
+        $params[':id'] = $exists['id'];
+        $stmt->execute($params);
+        return;
+    }
+
+    $stmt = $pdo->prepare("\n        INSERT INTO telegram_messages\n            (\n                telegram_update_id, telegram_chat_id, telegram_message_id, message_thread_id, topic_name,\n                sender_id, sender_name, sender_username, message_text, message_date, message_type,\n                media_file_id, media_file_unique_id, media_file_path, media_local_path, media_public_url,\n                image_analysis_text, image_analysis_status, image_analysis_error, analyzed_at,\n                detected_category, raw_payload\n            )\n        VALUES\n            (\n                :telegram_update_id, :telegram_chat_id, :telegram_message_id, :message_thread_id, :topic_name,\n                :sender_id, :sender_name, :sender_username, :message_text, :message_date, :message_type,\n                :media_file_id, :media_file_unique_id, :media_file_path, :media_local_path, :media_public_url,\n                :image_analysis_text, :image_analysis_status, :image_analysis_error, :analyzed_at,\n                :detected_category, :raw_payload\n            )\n    ");
+    $stmt->execute(bindMessageParams($data));
+}
+
+function bindMessageParams(array $data)
+{
+    return [
+        ':telegram_update_id' => $data['telegram_update_id'] ?? null,
+        ':telegram_chat_id' => $data['telegram_chat_id'] ?? null,
+        ':telegram_message_id' => $data['telegram_message_id'] ?? null,
+        ':message_thread_id' => normalizeThreadId($data['message_thread_id'] ?? 0),
+        ':topic_name' => $data['topic_name'] ?? null,
+        ':sender_id' => $data['sender_id'] ?? null,
+        ':sender_name' => $data['sender_name'] ?? null,
+        ':sender_username' => $data['sender_username'] ?? null,
+        ':message_text' => $data['message_text'] ?? null,
+        ':message_date' => $data['message_date'] ?? null,
+        ':message_type' => $data['message_type'] ?? 'other',
+        ':media_file_id' => $data['media_file_id'] ?? null,
+        ':media_file_unique_id' => $data['media_file_unique_id'] ?? null,
+        ':media_file_path' => $data['media_file_path'] ?? null,
+        ':media_local_path' => $data['media_local_path'] ?? null,
+        ':media_public_url' => $data['media_public_url'] ?? null,
+        ':image_analysis_text' => $data['image_analysis_text'] ?? null,
+        ':image_analysis_status' => $data['image_analysis_status'] ?? null,
+        ':image_analysis_error' => $data['image_analysis_error'] ?? null,
+        ':analyzed_at' => $data['analyzed_at'] ?? null,
+        ':detected_category' => $data['detected_category'] ?? null,
+        ':raw_payload' => $data['raw_payload'] ?? null,
+    ];
 }
 
 function isDashboardSetupCommand($text)
@@ -191,11 +275,7 @@ function handleDashboardSetupCommand(PDO $pdo, $chatId, $senderId)
     if ($minutes < 5) $minutes = 5;
     $expiresAt = (new DateTime('now'))->modify('+' . $minutes . ' minutes')->format('Y-m-d H:i:s');
 
-    $stmt = $pdo->prepare("\n        INSERT INTO telegram_dashboard_setup_tokens
-            (token, requested_by_chat_id, requested_by_user_id, expires_at)
-        VALUES
-            (:token, :chat_id, :user_id, :expires_at)
-    " );
+    $stmt = $pdo->prepare("\n        INSERT INTO telegram_dashboard_setup_tokens\n            (token, requested_by_chat_id, requested_by_user_id, expires_at)\n        VALUES\n            (:token, :chat_id, :user_id, :expires_at)\n    " );
     $stmt->execute([
         ':token' => $token,
         ':chat_id' => (string)$chatId,
@@ -211,7 +291,7 @@ function handleDashboardSetupCommand(PDO $pdo, $chatId, $senderId)
 function getKnownTopicName(PDO $pdo, $chatId, $threadId)
 {
     $stmt = $pdo->prepare("\n        SELECT topic_name FROM telegram_topics\n        WHERE telegram_chat_id = :chat_id AND message_thread_id = :thread_id\n        LIMIT 1\n    ");
-    $stmt->execute([':chat_id' => $chatId, ':thread_id' => $threadId ?: 0]);
+    $stmt->execute([':chat_id' => $chatId, ':thread_id' => normalizeThreadId($threadId)]);
     $row = $stmt->fetch();
     return $row['topic_name'] ?? null;
 }
@@ -222,24 +302,45 @@ function detectMessageType(array $message, $text)
     if (isset($message['video'])) return 'video';
     if (isset($message['document'])) return 'document';
     if (isset($message['voice'])) return 'voice';
+    if (isset($message['audio'])) return 'audio';
     if (isset($message['sticker'])) return 'sticker';
     if (isset($message['forum_topic_created'])) return 'topic_created';
+    if (isset($message['forum_topic_edited'])) return 'topic_edited';
+    if (isset($message['forum_topic_closed'])) return 'topic_closed';
+    if (isset($message['forum_topic_reopened'])) return 'topic_reopened';
     if ($text !== null) return 'text';
     return 'other';
 }
 
 function detectTopicName(array $message)
 {
-    if (!empty($message['forum_topic_created']['name'])) {
-        return $message['forum_topic_created']['name'];
-    }
-    if (!empty($message['reply_to_message']['forum_topic_created']['name'])) {
-        return $message['reply_to_message']['forum_topic_created']['name'];
-    }
-    if (!empty($message['reply_to_message']['reply_to_message']['forum_topic_created']['name'])) {
-        return $message['reply_to_message']['reply_to_message']['forum_topic_created']['name'];
+    $paths = [
+        ['forum_topic_created', 'name'],
+        ['forum_topic_edited', 'name'],
+        ['reply_to_message', 'forum_topic_created', 'name'],
+        ['reply_to_message', 'forum_topic_edited', 'name'],
+        ['reply_to_message', 'reply_to_message', 'forum_topic_created', 'name'],
+        ['reply_to_message', 'reply_to_message', 'forum_topic_edited', 'name'],
+    ];
+    foreach ($paths as $path) {
+        $value = arrayPath($message, $path);
+        if (is_string($value) && trim($value) !== '') {
+            return trim($value);
+        }
     }
     return null;
+}
+
+function arrayPath(array $array, array $path)
+{
+    $value = $array;
+    foreach ($path as $key) {
+        if (!is_array($value) || !array_key_exists($key, $value)) {
+            return null;
+        }
+        $value = $value[$key];
+    }
+    return $value;
 }
 
 function extractLargestPhoto(array $message)
